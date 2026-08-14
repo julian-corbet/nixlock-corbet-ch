@@ -29,7 +29,7 @@ use smithay_client_toolkit::{
     shm::{slot::SlotPool, Shm, ShmHandler},
 };
 use std::sync::mpsc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use wayland_client::{
     globals::registry_queue_init,
     protocol::{wl_keyboard::WlKeyboard, wl_output, wl_seat::WlSeat, wl_shm, wl_surface},
@@ -156,6 +156,8 @@ fn run_inner(
         failed: false,
         verifying: false,
         attempt_tx,
+        fail_count: 0,
+        locked_until: None,
     };
 
     event_queue
@@ -179,6 +181,12 @@ fn run_inner(
         .map_err(|e| LockError::Wayland(e.to_string()))?;
     handle
         .insert_source(Timer::from_duration(Duration::from_secs(1)), |_, _, l| {
+            // Sweep an expired wrong-password backoff here rather than a dedicated one-shot timer:
+            // this 1s tick already runs unconditionally, so checking `Instant::now()` against
+            // `locked_until` needs no extra `LoopHandle` stashed on `Locker`.
+            if l.locked_until.is_some_and(|until| Instant::now() >= until) {
+                l.locked_until = None;
+            }
             l.redraw_all();
             TimeoutAction::ToDuration(Duration::from_secs(1))
         })
@@ -225,6 +233,14 @@ struct Locker {
     failed: bool,
     verifying: bool,
     attempt_tx: mpsc::Sender<Zeroizing<String>>,
+    /// Consecutive `Wrong`/`MaxTries`/`Error` verdicts since the last (never-happened, since a
+    /// success exits) reset. Drives the backoff delay below.
+    fail_count: u32,
+    /// Set on a failed verdict to `now + backoff`; while `Some` and still in the future, new
+    /// attempts are refused (`submit`/`press_key`) so a wrong password cannot be retried faster
+    /// than the delay. Cleared once expiry is observed (checked lazily, and swept by the existing
+    /// 1s repaint timer) — never a lockout (`SESSION-1`: always retryable, just not instantly).
+    locked_until: Option<Instant>,
 }
 
 impl Locker {
@@ -320,8 +336,16 @@ impl Locker {
         }
     }
 
+    /// `true` while a wrong-password backoff delay is still running. Checked lazily against
+    /// `Instant::now()` — no dedicated expiry callback needed, since a `false` result here is
+    /// exactly as good as an eagerly-cleared `None` (see the repaint timer for the sweep that keeps
+    /// `locked_until` from growing stale forever).
+    fn backoff_active(&self) -> bool {
+        self.locked_until.is_some_and(|until| Instant::now() < until)
+    }
+
     fn submit(&mut self) {
-        if self.verifying || self.password.is_empty() {
+        if self.verifying || self.backoff_active() || self.password.is_empty() {
             return;
         }
         let pw = std::mem::take(&mut self.password);
@@ -344,6 +368,11 @@ impl Locker {
             AuthOutcome::Wrong | AuthOutcome::MaxTries | AuthOutcome::Error => {
                 self.failed = true;
                 self.password.clear();
+                // Growing backoff before the NEXT attempt is accepted (SESSION-1: always
+                // retryable, just not instantly) -- 1s,2s,3s,4s,5s, capped at 5s.
+                self.fail_count = self.fail_count.saturating_add(1);
+                let delay = Duration::from_secs(self.fail_count.min(5) as u64);
+                self.locked_until = Some(Instant::now() + delay);
                 self.redraw_locks();
             }
         }
@@ -440,8 +469,8 @@ impl KeyboardHandler for Locker {
     fn enter(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlKeyboard, _: &wl_surface::WlSurface, _: u32, _: &[u32], _: &[Keysym]) {}
     fn leave(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlKeyboard, _: &wl_surface::WlSurface, _: u32) {}
     fn press_key(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlKeyboard, _: u32, event: KeyEvent) {
-        if self.verifying {
-            return; // one attempt in flight (AUTH-2)
+        if self.verifying || self.backoff_active() {
+            return; // one attempt in flight (AUTH-2), or cooling down after a wrong one
         }
         match event.keysym {
             Keysym::Return | Keysym::KP_Enter => self.submit(),

@@ -6,6 +6,7 @@
 //! the setuid `unix_chkpwd` to read `/etc/shadow` — that privilege lives in the audited pam helper,
 //! never in nixlock. nixlock must never be setuid.
 
+use std::ffi::{CStr, CString};
 use std::sync::mpsc;
 use zeroize::Zeroizing;
 
@@ -17,14 +18,62 @@ pub enum AuthOutcome {
     Error,
 }
 
+/// A `pam_client::ConversationHandler` that answers PAM's password prompts straight out of a
+/// zeroizing buffer and nothing else (`AUTH-1`).
+///
+/// `pam_client::conv_mock::Conversation` (the crate's built-in mock handler) copies the plaintext
+/// into a plain, non-zeroizing `String` internally — fine for its intended use (tests), wrong for a
+/// lock screen that holds a real login password. This handler holds exactly one `Zeroizing<String>`
+/// and never clones it; the single unavoidable exception is the `CString` each prompt answer
+/// returns, because that is the type `libpam`'s C API requires — pam-client hands it across the FFI
+/// boundary and it is freed there, outside anything we control. That one conversion is the "one
+/// CString libpam requires" the crate's contract makes unavoidable; nothing else is copied.
+struct PasswordConversation {
+    password: Zeroizing<String>,
+}
+
+impl pam_client::ConversationHandler for PasswordConversation {
+    /// The normal password prompt (`PAM_PROMPT_ECHO_OFF`, characters not echoed).
+    fn prompt_echo_off(&mut self, _prompt: &CStr) -> Result<CString, pam_client::ErrorCode> {
+        CString::new(self.password.as_bytes()).map_err(|_| pam_client::ErrorCode::CONV_ERR)
+    }
+
+    /// Fallback only: some PAM stacks issue an echoed prompt (`PAM_PROMPT_ECHO_ON`) instead. A
+    /// plain `pam_unix` password check never does, but answering it the same way (rather than
+    /// refusing) keeps a legitimate, differently-configured stack working without ever showing or
+    /// echoing anything ourselves.
+    fn prompt_echo_on(&mut self, _prompt: &CStr) -> Result<CString, pam_client::ErrorCode> {
+        CString::new(self.password.as_bytes()).map_err(|_| pam_client::ErrorCode::CONV_ERR)
+    }
+
+    /// `PAM_TEXT_INFO` — ignored. PAM module chatter never reaches the lock screen or a log
+    /// (`AUTH-1`: the only thing this handler ever says back is the password itself, to PAM).
+    fn text_info(&mut self, _msg: &CStr) {}
+
+    /// `PAM_ERROR_MSG` — ignored, same reasoning as `text_info`.
+    fn error_msg(&mut self, _msg: &CStr) {}
+
+    /// Anything asking a yes/no question is unexpected for a password check — fail closed rather
+    /// than guess an answer.
+    fn radio_prompt(&mut self, _prompt: &CStr) -> Result<bool, pam_client::ErrorCode> {
+        Err(pam_client::ErrorCode::CONV_ERR)
+    }
+
+    /// Binary protocol exchange is unexpected here too — fail closed.
+    fn binary_prompt(
+        &mut self,
+        _type: u8,
+        _data: &[u8],
+    ) -> Result<(u8, Vec<u8>), pam_client::ErrorCode> {
+        Err(pam_client::ErrorCode::CONV_ERR)
+    }
+}
+
 /// One PAM attempt, built + run entirely on the worker thread (pam `Context` is `!Send`).
 fn authenticate_once(service: &str, user: &str, password: Zeroizing<String>) -> AuthOutcome {
-    use pam_client::conv_mock::Conversation;
     use pam_client::{Context, Flag};
 
-    // NOTE: pam-client's mock conversation copies the plaintext; a custom zeroizing
-    // ConversationHandler is a tracked hardening (experiments/). The buffer we hold is wiped on drop.
-    let conv = Conversation::with_credentials(user.to_owned(), password.to_string());
+    let conv = PasswordConversation { password };
     let mut ctx = match Context::new(service, Some(user), conv) {
         Ok(c) => c,
         Err(_) => return AuthOutcome::Error, // service missing / init failed -> FAIL CLOSED (AUTH-3)
@@ -43,6 +92,8 @@ fn authenticate_once(service: &str, user: &str, password: Zeroizing<String>) -> 
             }
         }
     }
+    // `ctx` (and the `PasswordConversation` it owns) drops here: the `Zeroizing<String>` wipes
+    // itself, and this is the only long-lived copy of the plaintext there ever was.
 }
 
 /// Spawns the persistent auth worker. Keeping it persistent lets `pam_faillock` counters and
