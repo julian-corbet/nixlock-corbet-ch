@@ -28,3 +28,6 @@ mod theme;
 pub use content::{AuthState, AuthView, Frame, KioskContent, OutputRole};
 pub use locker::{builder, run, Builder, Config, LockError};
 pub use lockscreen::ClockLockScreen;
+
+/// Verbose PAM auth check used by `nixlock --check-auth` (verify your PAM service works).
+pub use auth::diagnose as check_auth;

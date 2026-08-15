@@ -96,6 +96,37 @@ fn authenticate_once(service: &str, user: &str, password: Zeroizing<String>) -> 
     // itself, and this is the only long-lived copy of the plaintext there ever was.
 }
 
+/// Verbose one-shot auth check for `nixlock --check-auth`: runs the exact auth path and prints
+/// which PAM stage fails and its error code. Never prints the password (only its length).
+pub fn diagnose(service: &str, user: &str, password: String) {
+    use pam_client::{Context, Flag};
+    eprintln!("nixlock[diag]: service={service:?} user={user:?} pw_len={}", password.len());
+    let conv = PasswordConversation {
+        password: Zeroizing::new(password),
+    };
+    let mut ctx = match Context::new(service, Some(user), conv) {
+        Ok(c) => {
+            eprintln!("nixlock[diag]: Context::new OK");
+            c
+        }
+        Err(e) => {
+            eprintln!("nixlock[diag]: Context::new FAILED: {e}");
+            return;
+        }
+    };
+    match ctx.authenticate(Flag::NONE) {
+        Ok(()) => eprintln!("nixlock[diag]: authenticate() OK"),
+        Err(e) => {
+            eprintln!("nixlock[diag]: authenticate() FAILED code={:?}: {e}", e.code());
+            return;
+        }
+    }
+    match ctx.acct_mgmt(Flag::NONE) {
+        Ok(()) => eprintln!("nixlock[diag]: acct_mgmt() OK  =>  WOULD UNLOCK"),
+        Err(e) => eprintln!("nixlock[diag]: acct_mgmt() FAILED code={:?}: {e}", e.code()),
+    }
+}
+
 /// Spawns the persistent auth worker. Keeping it persistent lets `pam_faillock` counters and
 /// backoff accumulate coherently across attempts. Passwords arrive on `attempts`; verdicts go out
 /// on `results` (a calloop channel, which wakes the event loop cleanly).

@@ -6,6 +6,9 @@
 use nixlock::{run, ClockLockScreen, Config};
 
 fn main() {
+    if std::env::args().any(|a| a == "--check-auth") {
+        return check_auth_mode();
+    }
     let mut daemonize = false;
     for a in std::env::args().skip(1) {
         match a.as_str() {
@@ -26,6 +29,18 @@ fn main() {
         eprintln!("nixlock: fatal: {e}");
         std::process::exit(1);
     }
+}
+
+/// `nixlock --check-auth`: read a password from stdin and run the exact PAM path verbosely, to
+/// verify a host's PAM service authenticates the current user. Never echoes the password.
+fn check_auth_mode() {
+    use std::io::Read;
+    let cfg = load_config();
+    let user = std::env::var("USER").unwrap_or_else(|_| "root".to_string());
+    let mut pw = String::new();
+    std::io::stdin().read_to_string(&mut pw).ok();
+    let pw = pw.trim_end_matches(['\n', '\r']).to_string();
+    nixlock::check_auth(&cfg.pam_service, &user, pw);
 }
 
 fn load_config() -> Config {
