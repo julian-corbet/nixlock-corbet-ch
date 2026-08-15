@@ -1,9 +1,10 @@
 //! The default `nixlock` binary: a swaylock-compatible clock locker (the shipped `ClockLockScreen`
-//! on every output). Kiosk dashboards come from library consumers (e.g. nixwatch) that link the
-//! crate and implement `KioskContent`. Per-host values come from
+//! on every `Session` output). A `Kiosk` output shows whatever a client streams over the kiosk
+//! display Unix socket (e.g. `nixwatch-frames`) -- see `nixlock::socket`'s wire protocol -- and
+//! the same built-in clock otherwise. Per-host values come from
 //! `$XDG_CONFIG_HOME/nixlock/config.json`, because swayidle only ever appends `-f`.
 
-use nixlock::{run, ClockLockScreen, Config};
+use nixlock::{run, Config};
 
 fn main() {
     if std::env::args().any(|a| a == "--check-auth") {
@@ -25,7 +26,7 @@ fn main() {
         eprintln!("nixlock: -f accepted (before-sleep daemonization is a TODO)");
     }
 
-    if let Err(e) = run(load_config(), ClockLockScreen::new()) {
+    if let Err(e) = run(load_config()) {
         eprintln!("nixlock: fatal: {e}");
         std::process::exit(1);
     }
@@ -50,6 +51,8 @@ fn load_config() -> Config {
         kiosk_outputs: Vec<String>,
         #[serde(default)]
         pam_service: Option<String>,
+        #[serde(default)]
+        socket_path: Option<String>,
     }
     let path = std::env::var("XDG_CONFIG_HOME")
         .map(|d| format!("{d}/nixlock/config.json"))
@@ -68,6 +71,7 @@ fn load_config() -> Config {
             .or(file.pam_service)
             .unwrap_or_else(|| "nixlock".to_string()),
         username: None,
+        socket_path: file.socket_path.map(std::path::PathBuf::from),
     }
 }
 
@@ -80,8 +84,13 @@ fn help() {
            -h, --help        this help\n\
            -v, --version     print version\n\
          \n\
-         CONFIG: $XDG_CONFIG_HOME/nixlock/config.json  {{ kiosk_outputs: [..], pam_service: \"..\" }}\n\
-         The default binary shows the clock lock screen on every output; kiosk dashboards come from\n\
-         library consumers that implement nixlock::KioskContent."
+         CONFIG: $XDG_CONFIG_HOME/nixlock/config.json\n\
+           {{ kiosk_outputs: [..], pam_service: \"..\", socket_path: \"..\" }}\n\
+         \n\
+         The default binary shows the clock lock screen on every `Session` output. A `Kiosk`\n\
+         output shows whatever a client streams over the kiosk display Unix socket (DISPLAY-1) --\n\
+         socket_path, default $XDG_RUNTIME_DIR/nixlock.sock -- or the same built-in clock until a\n\
+         frame arrives / after the client disconnects. That socket is DISPLAY-ONLY: it can never\n\
+         unlock the session (DISPLAY-2); unlock is PAM-only, exactly as on every Session output."
     );
 }

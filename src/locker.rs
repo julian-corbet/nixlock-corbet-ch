@@ -1,12 +1,17 @@
 //! The content-agnostic locker: acquires the `ext-session-lock`, creates one surface per output,
-//! classifies each output's role, paints it via pluggable [`KioskContent`], routes keyboard input
-//! to a password buffer, and unlocks the whole session on a correct PAM password. Fail-closed.
+//! classifies each output's role, routes keyboard input to a password buffer, and unlocks the
+//! whole session on a correct PAM password. Fail-closed. A `Session` output always paints the
+//! (pluggable, via `builder().session(..)`) lock-screen [`KioskContent`]; a `Kiosk` output paints
+//! the latest frame from the kiosk display socket (`crate::socket`, run on its own thread here) or
+//! the same built-in clock whenever the socket has nothing current for it.
 
 use crate::auth::{self, AuthOutcome};
 use crate::content::{AuthState, AuthView, Frame, KioskContent, OutputRole};
 use crate::lockscreen::ClockLockScreen;
+use crate::socket::{self, SocketState};
 use calloop::{
     channel::{channel, Event as ChanEvent},
+    ping::make_ping,
     timer::{TimeoutAction, Timer},
     EventLoop,
 };
@@ -28,7 +33,8 @@ use smithay_client_toolkit::{
     },
     shm::{slot::SlotPool, Shm, ShmHandler},
 };
-use std::sync::mpsc;
+use std::path::PathBuf;
+use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 use wayland_client::{
     globals::registry_queue_init,
@@ -47,6 +53,12 @@ pub struct Config {
     pub pam_service: String,
     /// Username to authenticate; `None` = the current `$USER`.
     pub username: Option<String>,
+    /// Path to the kiosk display Unix socket. `None` (the default) resolves to
+    /// `$XDG_RUNTIME_DIR/nixlock.sock` at startup; if that env var is also unset the socket server
+    /// is skipped entirely (the kiosk output then always shows the built-in clock) -- a display
+    /// feature must never block or weaken the lock itself. See `crate::socket` for the wire
+    /// protocol a client streams frames over.
+    pub socket_path: Option<PathBuf>,
 }
 
 #[non_exhaustive]
@@ -67,49 +79,41 @@ impl std::fmt::Display for LockError {
 }
 impl std::error::Error for LockError {}
 
-/// The entrypoint. Locks now, `ClockLockScreen` on `Session` outputs and `kiosk` on `Kiosk`
-/// outputs, and blocks until the correct password unlocks the whole session.
-pub fn run(config: Config, kiosk: impl KioskContent) -> Result<(), LockError> {
-    run_inner(config, Box::new(kiosk), Box::new(ClockLockScreen::new()))
+/// The entrypoint. Locks now: the built-in [`ClockLockScreen`] on `Session` outputs, and on
+/// `Kiosk` outputs whatever the kiosk socket (`Config::socket_path`) is streaming — or that same
+/// clock, until a frame arrives or after the streaming client disconnects. Blocks until the
+/// correct password unlocks the whole session.
+pub fn run(config: Config) -> Result<(), LockError> {
+    run_inner(config, Box::new(ClockLockScreen::new()))
 }
 
-/// Full control — override the `Session` lock screen too.
+/// Full control — override the `Session` lock screen (the `Kiosk` fallback is always the shipped
+/// clock; the socket is the only way to change what a `Kiosk` output actually shows).
 pub fn builder(config: Config) -> Builder {
     Builder {
         config,
-        kiosk: None,
         session: None,
     }
 }
 
 pub struct Builder {
     config: Config,
-    kiosk: Option<Box<dyn KioskContent>>,
     session: Option<Box<dyn KioskContent>>,
 }
 impl Builder {
-    pub fn kiosk(mut self, c: impl KioskContent) -> Self {
-        self.kiosk = Some(Box::new(c));
-        self
-    }
     pub fn session(mut self, c: impl KioskContent) -> Self {
         self.session = Some(Box::new(c));
         self
     }
     pub fn run(self) -> Result<(), LockError> {
-        let kiosk = self.kiosk.unwrap_or_else(|| Box::new(ClockLockScreen::new()));
         let session = self
             .session
             .unwrap_or_else(|| Box::new(ClockLockScreen::new()));
-        run_inner(self.config, kiosk, session)
+        run_inner(self.config, session)
     }
 }
 
-fn run_inner(
-    config: Config,
-    kiosk_content: Box<dyn KioskContent>,
-    session_content: Box<dyn KioskContent>,
-) -> Result<(), LockError> {
+fn run_inner(config: Config, session_content: Box<dyn KioskContent>) -> Result<(), LockError> {
     let username = config
         .username
         .clone()
@@ -136,6 +140,17 @@ fn run_inner(
     let (result_tx, result_ch) = channel::<AuthOutcome>();
     auth::spawn(config.pam_service.clone(), username, attempt_rx, result_tx);
 
+    // The kiosk display socket. Best-effort and DISPLAY-ONLY (DISPLAY-2): a bind failure here
+    // never fails the lock, it just means the kiosk output shows the built-in clock forever —
+    // see `socket::spawn`/`socket::resolve_path`.
+    let socket_state = SocketState::new();
+    match socket::resolve_path(config.socket_path.as_deref()) {
+        Some(path) => socket::spawn(path, Arc::clone(&socket_state)),
+        None => eprintln!(
+            "nixlock: socket: no XDG_RUNTIME_DIR and no socket_path configured; kiosk socket disabled"
+        ),
+    }
+
     let mut locker = Locker {
         registry_state: RegistryState::new(&globals),
         output_state,
@@ -148,8 +163,9 @@ fn run_inner(
         pool: None,
         surfaces: Vec::new(),
         kiosk_outputs: config.kiosk_outputs,
-        kiosk_content,
+        kiosk_fallback: ClockLockScreen::new(),
         session_content,
+        socket: socket_state,
         keyboard: None,
         password: Zeroizing::new(String::new()),
         caps_lock: false,
@@ -199,6 +215,19 @@ fn run_inner(
         })
         .map_err(|e| LockError::Wayland(e.to_string()))?;
 
+    // Repaint promptly when a new socket frame lands, rather than waiting for the 1s tick above.
+    // Not load-bearing (the tick alone keeps the kiosk output eventually-consistent), just nicer
+    // latency — so a failure to wire it is logged, not fatal.
+    match make_ping() {
+        Ok((ping, ping_source)) => {
+            locker.socket.set_ping(ping);
+            handle
+                .insert_source(ping_source, |_, _, l| l.redraw_all())
+                .map_err(|e| LockError::Wayland(e.to_string()))?;
+        }
+        Err(e) => eprintln!("nixlock: socket: repaint ping unavailable ({e}); 1s tick still applies"),
+    }
+
     event_loop
         .run(Duration::from_secs(1), &mut locker, |_| {})
         .map_err(|e| LockError::Wayland(e.to_string()))?;
@@ -211,6 +240,9 @@ struct Entry {
     name: String,
     width: u32,
     height: u32,
+    /// The output's scale factor, forwarded into the socket HELLO for `Kiosk`-role entries so a
+    /// client can render at the right density. `1` when the compositor never reports one.
+    scale: u32,
 }
 
 struct Locker {
@@ -225,8 +257,13 @@ struct Locker {
     pool: Option<SlotPool>,
     surfaces: Vec<Entry>,
     kiosk_outputs: Vec<String>,
-    kiosk_content: Box<dyn KioskContent>,
+    /// The `Kiosk` role's fallback content — always the shipped clock (no longer pluggable per
+    /// output; see `content.rs`'s header). Painted whenever the socket has no valid current frame.
+    kiosk_fallback: ClockLockScreen,
     session_content: Box<dyn KioskContent>,
+    /// The kiosk display socket's shared state (`crate::socket`) — the latest streamed frame, the
+    /// kiosk output's current geometry (written here on `configure`), and the repaint ping.
+    socket: Arc<SocketState>,
     keyboard: Option<WlKeyboard>,
     password: Zeroizing<String>,
     caps_lock: bool,
@@ -274,17 +311,32 @@ impl Locker {
         }
         let av = self.auth_view();
         let expect = (w * h * 4) as usize;
-        let rgba = {
-            let frame = Frame {
-                role,
-                output_name: &name,
-                width: w,
-                height: h,
-                auth: av,
-            };
-            match role {
-                OutputRole::Kiosk => self.kiosk_content.paint(&frame),
-                OutputRole::Session => self.session_content.paint(&frame),
+        // A `Kiosk` output blits the latest socket frame when one exists and its geometry matches
+        // this surface exactly; otherwise (no client yet, a disconnect, or a stale/mismatched
+        // size) it falls back to the built-in clock, same as `Session` — DISPLAY-1.
+        let socket_frame = if role == OutputRole::Kiosk {
+            let latest = self.socket.latest.lock().unwrap();
+            latest
+                .as_ref()
+                .filter(|f| f.width == w && f.height == h)
+                .map(|f| f.rgba.clone())
+        } else {
+            None
+        };
+        let rgba = match socket_frame {
+            Some(rgba) => rgba,
+            None => {
+                let frame = Frame {
+                    role,
+                    output_name: &name,
+                    width: w,
+                    height: h,
+                    auth: av,
+                };
+                match role {
+                    OutputRole::Kiosk => self.kiosk_fallback.paint(&frame),
+                    OutputRole::Session => self.session_content.paint(&frame),
+                }
             }
         };
         // KIOSK-2 / FRAME-1: a wrong-sized buffer is never blitted; fall back to the lock screen.
@@ -383,26 +435,24 @@ impl SessionLockHandler for Locker {
     fn locked(&mut self, _conn: &Connection, qh: &QueueHandle<Self>, session_lock: SessionLock) {
         // Create Session (lock-screen) outputs FIRST so keyboard focus lands on a lock screen,
         // never on a kiosk output (KIOSK-1: kiosk surfaces are input-inert).
-        let mut ordered: Vec<(wl_output::WlOutput, String, OutputRole)> = self
+        let mut ordered: Vec<(wl_output::WlOutput, String, OutputRole, u32)> = self
             .output_state
             .outputs()
             .map(|o| {
-                let name = self
-                    .output_state
-                    .info(&o)
-                    .and_then(|i| i.name)
-                    .unwrap_or_default();
+                let info = self.output_state.info(&o);
+                let name = info.as_ref().and_then(|i| i.name.clone()).unwrap_or_default();
+                let scale = info.as_ref().map(|i| i.scale_factor.max(1) as u32).unwrap_or(1);
                 let role = if self.kiosk_outputs.iter().any(|k| k == &name) {
                     OutputRole::Kiosk
                 } else {
                     OutputRole::Session
                 };
-                (o, name, role)
+                (o, name, role, scale)
             })
             .collect();
-        ordered.sort_by_key(|(_, _, role)| *role == OutputRole::Kiosk); // Session (false) first
+        ordered.sort_by_key(|(_, _, role, _)| *role == OutputRole::Kiosk); // Session (false) first
         eprintln!("nixlock: locked; {} output(s)", ordered.len());
-        for (output, name, role) in ordered {
+        for (output, name, role, scale) in ordered {
             let surface = self.compositor.create_surface(qh);
             let lock_surface = session_lock.create_lock_surface(surface, &output, qh);
             eprintln!("nixlock:   '{name}' -> {role:?}");
@@ -412,6 +462,7 @@ impl SessionLockHandler for Locker {
                 name,
                 width: 0,
                 height: 0,
+                scale,
             });
         }
     }
@@ -437,6 +488,12 @@ impl SessionLockHandler for Locker {
         {
             self.surfaces[idx].width = w;
             self.surfaces[idx].height = h;
+            // The one (v1) kiosk output's geometry is what a connecting socket client's HELLO
+            // reports, and what an already-connected client's frames are validated against — keep
+            // it current on every configure, including a later resize.
+            if self.surfaces[idx].role == OutputRole::Kiosk {
+                self.socket.set_geometry(w, h, self.surfaces[idx].scale);
+            }
             self.render_surface(idx);
         }
     }

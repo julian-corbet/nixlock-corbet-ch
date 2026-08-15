@@ -17,12 +17,16 @@ It is built on smithay-client-toolkit 0.20 and renders on the **CPU** into
 `wl_shm` buffers (tiny-skia, no GL/Vulkan/Mesa), so it drops into any wlroots
 compositor -- sway, scroll, hyprland -- without a driver in its closure.
 
+nixlock is a **content-blind display SERVER**: the kiosk output shows whatever
+premultiplied-RGBA frames a client streams to it over a tiny Unix socket
+protocol (see [Streaming kiosk content](#streaming-kiosk-content) below) -- any
+language, any process, started and supervised entirely independently of
+nixlock. `nixwatch` is exactly such a client (its `nixwatch-frames` binary).
 nixlock ships two things from one crate:
 
-- a **library** -- implement the `KioskContent` trait with your dashboard and
-  link it (a consumer such as `nixwatch` does exactly this); and
+- the **socket server** itself (always on, part of every run -- see below); and
 - a **default binary**, `nixlock`, a swaylock-CLI-compatible clock locker you
-  can drop in with zero code.
+  can drop in with zero code and zero streaming client at all.
 
 ## Quickstart
 
@@ -65,62 +69,74 @@ Every output the compositor lists at lock time is one of two roles:
 - **Session** -- an ordinary lock screen. It prompts for a password; a correct
   PAM password unlocks the whole session (there is one lock, shared across all
   outputs -- unlocking any Session screen unlocks the machine).
-- **Kiosk** -- a live display with **no password field and no input**. It renders
-  content (a dashboard, or the shipped clock) and keeps updating while the
-  machine is locked. Keyboard and pointer over a kiosk output are consumed by
-  the lock and never reach the content or any session client
-  (`BEHAVIORS.md` KIOSK-1).
+- **Kiosk** -- a live display with **no password field and no input**. It shows
+  whatever a socket client is streaming (a dashboard, or nixlock's own clock
+  while nothing is) and keeps updating while the machine is locked. Keyboard and
+  pointer over a kiosk output are consumed by the lock and never reach a socket
+  client or any session client (`BEHAVIORS.md` KIOSK-1).
 
 Which outputs are kiosk is a per-host value (`kioskOutputs`, a list of connector
 names such as `DP-3`). Anything not named is a Session output. Name nothing and
 every output is a Session lock -- the plain swaylock-equivalent baseline.
 
-If a kiosk output's content fails, that output falls back to the Session lock
-screen (KIOSK-2). A broken dashboard degrades toward *more* lock, never toward a
-revealed or blank screen.
+If a kiosk output's socket client sends nothing usable (not connected yet, a
+mismatched frame, a disconnect), that output falls back to nixlock's own built-in
+clock (`DISPLAY-1`). A broken/absent dashboard degrades toward *more* lock, never
+toward a revealed or blank screen.
 
-## Writing content
+## Streaming kiosk content
 
-Kiosk (and Session) content is a trait. A consumer implements it and links
-nixlock as a library:
+A kiosk output is fed by ANY process that connects to nixlock's Unix socket and
+speaks this wire protocol -- not a linked Rust trait, not something that runs
+inside nixlock at all. `nixwatch`'s `nixwatch-frames` binary is exactly such a
+client; write your own in any language that can open a Unix socket.
 
-```rust
-use nixlock::{run, Config, Frame, KioskContent};
+**Socket.** `$XDG_RUNTIME_DIR/nixlock.sock` by default (override with
+`socket_path` in `config.json`). nixlock creates and listens on it, unlinking any
+stale socket left by a previous run first. One client at a time -- a new
+connection replaces whatever was streaming before it.
 
-struct Dashboard { /* your state */ }
+**On connect**, nixlock immediately writes a **HELLO** (all integers
+little-endian):
 
-impl KioskContent for Dashboard {
-    /// Return one frame as premultiplied RGBA, exactly width * height * 4 bytes.
-    fn paint(&mut self, frame: &Frame) -> Vec<u8> {
-        // draw with tiny-skia (or anything that yields premultiplied RGBA),
-        // sized to frame.width x frame.height
-        vec![0u8; (frame.width * frame.height * 4) as usize]
-    }
-    // optional: how often to repaint absent input (default 1s)
-    // fn tick_interval(&self) -> std::time::Duration { .. }
-}
+| bytes | field | meaning |
+|---|---|---|
+| 8 | magic | `b"NIXLOCK1"` |
+| 4 | `width: u32` | the kiosk output's current width in pixels |
+| 4 | `height: u32` | the kiosk output's current height in pixels |
+| 4 | `scale: u32` | the kiosk output's scale factor |
 
-fn main() {
-    let config = Config {
-        kiosk_outputs: vec!["DP-3".into()],
-        pam_service: "nixlock".into(),
-        username: None,               // derive the current user
-    };
-    run(config, Dashboard { /* .. */ }).unwrap();
-}
-```
+`width = height = 0` means "no kiosk output" -- either `kioskOutputs` is empty on
+this host, or (a narrow startup race) the compositor has not sent the kiosk
+surface's first `configure` yet. A client that reads `0x0` should idle or exit
+rather than try to stream at that size.
 
-`paint` returns premultiplied RGBA; the framework owns the BGRA swizzle and the
-`wl_shm` commit, and rejects a wrong-sized buffer (that output falls back to the
-lock screen, KIOSK-2). The auth conversation runs off the render loop, so `paint`
-is called on a steady frame clock and never blocks on PAM, and PAM never blocks
-the clock (AUTH-2).
+**Then, repeatedly, the client sends FRAMES** — no reply, no acknowledgement:
 
-An **out-of-process** content path -- a dashboard as a separate program in any
-language, feeding frames over a pipe or shared memory -- is **planned, not in
-v1** (the `kioskCommand` option and its transport; see
-[`experiments/README.md`](experiments/README.md) #003). v1 is the in-process
-trait plus the default clock binary.
+| bytes | field | meaning |
+|---|---|---|
+| 4 | `width: u32` | this frame's width |
+| 4 | `height: u32` | this frame's height |
+| `width*height*4` | pixels | premultiplied RGBA8, row-major, top-down, stride = `width*4` |
+
+nixlock blits the **latest fully-received frame whose geometry matches the kiosk
+output exactly** onto it (RGBA -> BGRA swizzle into the `wl_shm` surface, same
+path the built-in clock uses). A frame with the wrong geometry is dropped --
+never blitted -- and the connection stays open, so a client mid-resize just has
+frames ignored until it catches up. Until any valid frame has arrived, or once
+the client disconnects, the kiosk output shows nixlock's own clock (`DISPLAY-1`).
+
+**Display-only, always** (`DISPLAY-2`): nixlock parses only the width/height
+header on this socket -- it is content-blind to the pixels -- and nothing that
+arrives on it can reach the password buffer, the auth state machine, or the
+unlock call. Unlock stays PAM-only, exactly as on every Session output. A
+reverse channel (input events flowing back to a streamed dashboard) is a
+plausible future addition and is deliberately not built here.
+
+`KioskContent` (the trait) still exists, but only as the mechanism BEHIND
+nixlock's own built-in clock and the `Session` lock screen -- a library consumer
+overrides the latter via `builder().session(..)` (below); it is no longer a
+per-output kiosk content API.
 
 ## The lock screen
 
@@ -162,7 +178,7 @@ The default binary is a drop-in for the contract swayidle already speaks:
 - the process stays named `nixlock`, so `pkill -USR1 nixlock` reaches it, and
   `SIGUSR1` re-shows the password indicator (swaylock's own convention).
 - per-host values swayidle cannot pass on the command line -- kiosk outputs, the
-  kiosk command, the PAM service -- are read from
+  PAM service, the kiosk socket path -- are read from
   `$XDG_CONFIG_HOME/nixlock/config.json`, which the home-manager module renders.
 
 That is the whole CLI surface. nixlock replaces `swaylock` in an existing
@@ -186,15 +202,16 @@ swayidle setup with no change to swayidle.
 ## Behaviour contract
 
 Security invariants are stated as named, outside-observable behaviours in
-[`BEHAVIORS.md`](BEHAVIORS.md) (`LOCK-*`, `KIOSK-*`, `AUTH-*`, `SESSION-*`,
-`COMPAT-*`). Review that file instead of the code when the question is "what is
-this allowed to do."
+[`BEHAVIORS.md`](BEHAVIORS.md) (`LOCK-*`, `KIOSK-*`, `DISPLAY-*`, `AUTH-*`,
+`SESSION-*`, `COMPAT-*`). Review that file instead of the code when the question
+is "what is this allowed to do."
 
 ## Status
 
-Early. v1 is the in-process `KioskContent` trait plus the default clock binary;
-the out-of-process content path is planned (see the ledger). Defaults that are
-reasoned rather than measured are tracked openly in
+Early. Kiosk content is out-of-process, over the socket protocol above
+([Streaming kiosk content](#streaming-kiosk-content)); the default clock binary
+needs no client at all. Defaults that are reasoned rather than measured are
+tracked openly in
 [`experiments/README.md`](experiments/README.md), and measured findings in
 [`studies/README.md`](studies/README.md).
 

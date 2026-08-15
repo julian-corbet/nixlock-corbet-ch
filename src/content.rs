@@ -1,6 +1,10 @@
-//! The public content interface. nixlock is content-agnostic: it owns the lock, the per-output
-//! surfaces, keyboard input and PAM auth, and asks a [`KioskContent`] to paint each output. Both
-//! roles are content — the shipped [`crate::ClockLockScreen`] is just the default `Session` content.
+//! The content interface nixlock paints INTERNALLY: the `Session` (password) lock screen, always,
+//! and the `Kiosk` output's fallback clock whenever the socket has no live frame for it (see
+//! `crate::socket`). It is no longer a per-output plug-in API for kiosk content — that content now
+//! arrives over the Unix socket as raw premultiplied RGBA, content-blind to nixlock. A library
+//! consumer's only remaining lever here is overriding the `Session` look via [`crate::builder`];
+//! the shipped [`crate::ClockLockScreen`] is the default for both `Session` and the `Kiosk`
+//! fallback.
 
 use std::time::Duration;
 

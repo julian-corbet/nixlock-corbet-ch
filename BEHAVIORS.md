@@ -53,9 +53,11 @@ must be look-only.
 Not: the kiosk never receives input to "interact with the dashboard." It renders; it does not listen.
 
 ### KIOSK-2 — kiosk content failure ⇒ that output falls back to the lock screen
-**GIVEN** a kiosk output's content panics, produces no frame, or (planned out-of-process) its content
-command exits, **THEN** that output reverts to the ordinary Session lock screen, the other outputs are
-unaffected, and the session stays locked.
+**GIVEN** a kiosk output's content panics, produces no frame, or (the out-of-process path -- see
+`DISPLAY-1`) its streaming client sends nothing usable, **THEN** that output reverts to a known-safe
+fallback (nixlock's own clock, or -- the deeper safety net, a paint result whose byte count still
+disagrees with the surface after that -- the Session lock screen), the other outputs are unaffected,
+and the session stays locked.
 
 Why: a kiosk that fails must degrade toward MORE security (a lock screen), never toward less -- never a
 blank output that could read as "monitor off," never a frozen last frame, never a torn buffer. The
@@ -63,6 +65,37 @@ failure of an optional dashboard can weaken nothing.
 
 Not: a failed kiosk never unlocks, never reveals the desktop underneath, and never takes the rest of
 the lock down with it.
+
+## Kiosk display socket — content-blind, and never a second way in
+### DISPLAY-1 — a kiosk output shows the latest streamed frame, or the default clock
+**GIVEN** a `Kiosk` output, **THEN** it displays the most recently accepted frame from the kiosk
+display socket if one exists and its geometry matches the output exactly, and otherwise -- no
+client has ever connected, no frame has arrived yet, the geometry does not match, or the client has
+disconnected -- shows nixlock's own built-in clock. Never a blank output, a frozen last frame past a
+disconnect, or a torn/partial buffer.
+
+Why: this generalizes `KIOSK-2` to a client that lives in a whole separate process nixlock does not
+control at all. A dashboard process can crash, hang, or simply not have started yet; the kiosk
+output's failure mode must still be "falls back to something known-safe," exactly as an in-process
+content failure already had to.
+
+Not: nixlock does not retain or replay the last frame from a client that is no longer connected --
+a disconnect clears back to the clock immediately, not on some later timeout.
+
+### DISPLAY-2 — the socket is display-only; it can never unlock or accept input
+**GIVEN** any byte nixlock reads off the kiosk display socket, **THEN** it is used for exactly one
+purpose -- validated, then blitted as pixels to the `Kiosk` output -- and never reaches the
+password buffer, the auth state machine, or the compositor's unlock call. `SESSION-1` remains the
+only gate, entirely unaware the socket exists.
+
+Why: a second channel that can influence unlock, even indirectly, would BE the lock's weak point --
+so the socket protocol is deliberately one-directional and content-blind: nixlock parses only a
+width/height header to size and validate a frame, never interprets the pixels themselves.
+
+Not: nixlock never executes, evaluates, or forwards anything a kiosk client sends. A reverse channel
+(input events flowing client-ward, so a streamed dashboard could itself be interactive) is a
+plausible future addition and is deliberately NOT built here -- it would need its own accounting
+against `KIOSK-1` before it could exist at all.
 
 ## Authentication — the credential and the conversation
 ### AUTH-1 — the password lives only in a zeroizing buffer

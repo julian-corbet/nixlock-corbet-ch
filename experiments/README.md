@@ -55,21 +55,38 @@ allocation-per-frame vs paint-into, measuring frame-time and allocator pressure.
 
 ## 003 — out-of-process frame transport for a language-agnostic content plane (stdout pipe vs shm)
 
-**Question:** v1 kiosk content is in-process (implement the trait, link nixlock).
-A **planned** out-of-process path would let a dashboard in any language feed
-frames -- the `kioskCommand` option already exists so a host can declare its
-intended content command, but the transport is unbuilt. Length-prefixed RGBA
-frames on the child's stdout (dead simple, one copy per frame, trivial to write a
-producer for) or a shared-memory ring (zero-copy into the `wl_shm` buffer, but
-lifecycle, sizing on output-mode change, and cleanup-on-crash to get right)?
+**Question:** v1 kiosk content was in-process (implement the trait, link nixlock).
+An out-of-process path would let a dashboard in any language feed frames.
+Length-prefixed RGBA frames on a child's stdout (dead simple, one copy per frame,
+trivial to write a producer for) or a shared-memory ring (zero-copy into the
+`wl_shm` buffer, but lifecycle, sizing on output-mode change, and
+cleanup-on-crash to get right)?
 
-**Hypothesis:** start with the pipe -- the copy is cheap next to the clarity and
-the it-works-from-a-shell-script producer story, and `KIOSK-2` (a dead content
-command falls that output back to the lock screen) is easy to honour when the
-transport is a child process whose exit you already observe. shm earns its place
-only if the pipe copy measurably hurts.
+**Resolution:** neither, exactly -- a third shape turned out to fit better than
+either original candidate. nixlock now runs a **Unix-socket server**
+(`$XDG_RUNTIME_DIR/nixlock.sock`, see README's "Streaming kiosk content") that
+any independently-started, independently-supervised process can dial into and
+stream length-prefixed premultiplied-RGBA frames over -- `nixwatch-frames` is
+the first such client. This beats a child-process stdout pipe (nixlock does not
+spawn or own the content process's lifecycle at all, so a dashboard restarts on
+its own systemd unit, on its own schedule, with its own crash/backoff policy --
+`DISPLAY-1` covers the "nothing connected / nothing valid yet" case exactly the
+way `KIOSK-2` already covered a dead child) and keeps the one-copy-per-frame
+simplicity a shared-memory ring would have traded away for a harder lifecycle.
+The in-process `KioskContent`-per-output API this entry originally weighed
+against is gone; the trait survives only as the mechanism behind the built-in
+clock and the `Session` screen (`builder().session(..)`).
 
-**Status:** open (transport unbuilt; v1 is in-process only).
+**Note:** the home-manager `nixlock.kioskCommand` option (`home/locker.nix`)
+describes an OLDER, different planned shape -- nixlock itself spawning and
+supervising a content command -- that predates and was superseded by the design
+above (nixlock never spawns the streaming client; a host's session config does,
+as an ordinary service). It was never wired to anything (always rendered `null`
+unless set), so nothing regresses by its continued presence, but it is stale
+documentation now and worth retiring in a follow-up pass.
+
+**Status:** resolved -- see README's "Streaming kiosk content" and
+`BEHAVIORS.md`'s `DISPLAY-1`/`DISPLAY-2`.
 
 ## 004 — default tick / frame interval
 
