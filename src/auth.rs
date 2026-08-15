@@ -78,11 +78,14 @@ fn authenticate_once(service: &str, user: &str, password: Zeroizing<String>) -> 
         Ok(c) => c,
         Err(_) => return AuthOutcome::Error, // service missing / init failed -> FAIL CLOSED (AUTH-3)
     };
+    // A screen locker re-opens an already-valid, already-logged-in session, so we gate ONLY on the
+    // authentication phase (the password) and do NOT call pam_acct_mgmt. This matches swaylock and
+    // most lockers: the account phase (pam_faillock's account check, expiry, etc.) is not a screen
+    // unlock's concern, and requiring it wrongly rejects a correct password on real PAM stacks
+    // (observed: acct_mgmt returning AUTH_ERR after prior auth failures). SESSION-1 still holds:
+    // only a correct password reaches AuthOutcome::Unlocked.
     match ctx.authenticate(Flag::NONE) {
-        Ok(()) => match ctx.acct_mgmt(Flag::NONE) {
-            Ok(()) => AuthOutcome::Unlocked, // the ONLY unlock path (SESSION-1)
-            Err(_) => AuthOutcome::Error,    // expired/locked account -> stay locked
-        },
+        Ok(()) => AuthOutcome::Unlocked,
         Err(e) => {
             use pam_client::ErrorCode::*;
             match e.code() {
