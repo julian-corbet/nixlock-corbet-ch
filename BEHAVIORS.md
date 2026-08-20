@@ -146,13 +146,25 @@ PAM success -- and nothing adjacent to it: not a keypress count, not an elapsed 
 signal. Every other input path has to be provably incapable of unlocking.
 
 Not: no lockout that bricks the session -- a wrong password is always retryable -- and `SIGUSR1`
-re-shows the indicator (`COMPAT-1`) without touching auth state.
+re-shows the indicator (`COMPAT-1`) without touching auth state. Its handler stores one flag and
+returns; asserted against the handler's own source, so giving it auth state fails the build.
 
 ## Compatibility — the contract swayidle already speaks
 ### COMPAT-1 — swaylock-CLI compatible; `-f` daemonizes AFTER the lock is held; stays named `nixlock`
-**GIVEN** swayidle invoking `nixlock -f`, **THEN** nixlock acquires the lock FIRST and only then forks
-into the background (so nothing is ordered ahead of an un-held lock), the process stays named
-`nixlock` (so `pkill -USR1 nixlock` reaches it), and `SIGUSR1` re-shows the password indicator.
+**GIVEN** swayidle invoking `nixlock -f`, **THEN** the process stays named `nixlock` (so
+`pkill -USR1 nixlock` reaches it), and `SIGUSR1` is HANDLED: never fatal, and it repaints -- re-showing
+the password indicator -- within one repaint tick (<=1s), touching no auth state.
+
+**NOT YET TRUE, stated here rather than implied:** `-f` is accepted and does NOT fork; nixlock stays
+in the foreground. The intent above -- acquire the lock FIRST, then daemonize, so nothing is ordered
+ahead of an un-held lock -- is the target, not the behaviour. swayidle spawns commands detached, so
+idle-timeout locking works today; the `before-sleep` guarantee is what is missing.
+
+Why SIGUSR1 is called out as a guarantee and not a nicety: its default disposition is TERMINATE, and
+the fleet's swayidle line ends `unlock 'pkill -USR1 nixlock'`. With no handler installed that signal
+killed the locker, and by `LOCK-2` the compositor then holds every output locked with no client left
+to take a password -- the "lockout that bricks the session" `SESSION-1` forbids, reachable by the one
+signal the desk is actually wired to send.
 Per-host values it cannot receive on that command line -- kiosk outputs, kiosk command, PAM service --
 come from `$XDG_CONFIG_HOME/nixlock/config.json`, because swayidle only ever appends `-f`.
 

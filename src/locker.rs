@@ -6,6 +6,7 @@
 //! the same built-in clock whenever the socket has nothing current for it.
 
 use crate::auth::{self, AuthOutcome};
+use std::sync::atomic::{AtomicBool, Ordering};
 use crate::content::{AuthState, AuthView, Frame, KioskContent, OutputRole};
 use crate::lockscreen::ClockLockScreen;
 use crate::socket::{self, SocketState};
@@ -79,6 +80,33 @@ impl std::fmt::Display for LockError {
 }
 impl std::error::Error for LockError {}
 
+/// Set by the `SIGUSR1` handler, drained by the 1s repaint tick.
+static SIGUSR1_SEEN: AtomicBool = AtomicBool::new(false);
+
+/// `SIGUSR1`'s DEFAULT DISPOSITION IS TERMINATE, and that is why this exists.
+///
+/// The fleet's swayidle line ends `unlock 'pkill -USR1 nixlock'`, and `COMPAT-1` promises the
+/// signal reaches a process still named `nixlock`. With no handler installed that signal killed
+/// the locker outright -- and by `LOCK-2` the compositor then keeps every output locked with no
+/// client left to accept a password. That is exactly the "lockout that bricks the session"
+/// `SESSION-1` forbids, reachable by the one signal the desk is wired to send.
+///
+/// The handler stores a flag and returns. Nothing else: a signal handler may only call
+/// async-signal-safe functions, and an atomic store is one while locking a mutex or touching the
+/// wayland connection is not. The 1s repaint tick drains it, so delivery costs at most one tick.
+extern "C" fn on_sigusr1(_sig: libc::c_int) {
+    SIGUSR1_SEEN.store(true, Ordering::Relaxed);
+}
+
+/// Install the handler. Returns false if the kernel refused, which is logged and never fatal --
+/// failing to lock the screen because a signal disposition could not be set would be a far worse
+/// outcome than the signal staying lethal.
+fn install_sigusr1_handler() -> bool {
+    // SAFETY: `on_sigusr1` is `extern "C"`, does nothing but an atomic store, and the handler is
+    // installed once before the event loop runs.
+    unsafe { libc::signal(libc::SIGUSR1, on_sigusr1 as libc::sighandler_t) != libc::SIG_ERR }
+}
+
 /// The entrypoint. Locks now: the built-in [`ClockLockScreen`] on `Session` outputs, and on
 /// `Kiosk` outputs whatever the kiosk socket (`Config::socket_path`) is streaming — or that same
 /// clock, until a frame arrives or after the streaming client disconnects. Blocks until the
@@ -114,6 +142,11 @@ impl Builder {
 }
 
 fn run_inner(config: Config, session_content: Box<dyn KioskContent>) -> Result<(), LockError> {
+    // Before anything else, so a signal arriving during startup cannot kill a locker that has
+    // already told the compositor to lock.
+    if !install_sigusr1_handler() {
+        eprintln!("nixlock: could not install the SIGUSR1 handler; `pkill -USR1 nixlock` stays lethal");
+    }
     let username = config
         .username
         .clone()
@@ -202,6 +235,13 @@ fn run_inner(config: Config, session_content: Box<dyn KioskContent>) -> Result<(
             // `locked_until` needs no extra `LoopHandle` stashed on `Locker`.
             if l.locked_until.is_some_and(|until| Instant::now() >= until) {
                 l.locked_until = None;
+            }
+            // COMPAT-1: re-show the indicator on SIGUSR1. Deliberately touches NO auth state --
+            // not the typed buffer, not the failed flag, not the backoff -- because SESSION-1
+            // requires every non-PAM input path to be incapable of affecting the gate. The repaint
+            // below is the entire effect.
+            if SIGUSR1_SEEN.swap(false, Ordering::Relaxed) {
+                eprintln!("nixlock: SIGUSR1: re-showing the password indicator");
             }
             l.redraw_all();
             TimeoutAction::ToDuration(Duration::from_secs(1))
@@ -593,3 +633,49 @@ delegate_seat!(Locker);
 delegate_keyboard!(Locker);
 delegate_session_lock!(Locker);
 delegate_registry!(Locker);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Reaching the end of this test IS the assertion. SIGUSR1's default disposition terminates the
+    // process, so without the handler this kills the whole test binary rather than failing one
+    // case -- which is precisely what `pkill -USR1 nixlock` did to the live locker, leaving the
+    // compositor holding a lock with no client to unlock it (LOCK-2 + SESSION-1).
+    #[test]
+    fn sigusr1_is_survivable_and_observed() {
+        assert!(install_sigusr1_handler(), "kernel refused the SIGUSR1 handler");
+        SIGUSR1_SEEN.store(false, Ordering::Relaxed);
+
+        // SAFETY: raise() on the calling thread, with our handler installed above.
+        assert_eq!(unsafe { libc::raise(libc::SIGUSR1) }, 0);
+
+        assert!(
+            SIGUSR1_SEEN.swap(false, Ordering::Relaxed),
+            "the handler ran but did not record the signal, so the tick can never see it"
+        );
+    }
+
+    // SESSION-1: every input path that is not PAM has to be provably incapable of reaching the
+    // gate. Asserted against the handler's own source so that GIVING it auth state to touch fails
+    // the build -- the same guard the kiosk socket carries for DISPLAY-2.
+    #[test]
+    fn the_sigusr1_handler_touches_nothing_but_its_own_flag() {
+        let source = include_str!("locker.rs");
+        let body = source
+            .split("extern \"C\" fn on_sigusr1")
+            .nth(1)
+            .expect("handler not found")
+            .split("\n}")
+            .next()
+            .unwrap();
+
+        for forbidden in ["unlock", "password", "pam", "auth", "failed", "locked_until"] {
+            assert!(
+                !body.to_lowercase().contains(forbidden),
+                "the SIGUSR1 handler references `{forbidden}`: a signal must not be able to reach \
+                 authentication state (BEHAVIORS.md SESSION-1)"
+            );
+        }
+    }
+}

@@ -476,6 +476,7 @@ dependencies = [
  "calloop-wayland-source",
  "chrono",
  "fontdue",
+ "libc",
  "pam-client",
  "serde",
  "serde_json",

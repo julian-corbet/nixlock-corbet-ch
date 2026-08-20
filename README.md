@@ -173,10 +173,13 @@ put in an error (AUTH-1). Keyboard input is decoded through libxkbcommon.
 
 The default binary is a drop-in for the contract swayidle already speaks:
 
-- `nixlock -f` acquires the lock **first**, then daemonizes -- so nothing races
-  ahead of a held lock (COMPAT-1).
+- `nixlock -f` is accepted and **does not fork yet** -- it stays in the
+  foreground. swayidle spawns its commands detached, so idle-timeout locking
+  works; the `before-sleep` ordering guarantee (lock held before the system
+  suspends) is the part that is not yet honored. See COMPAT-1.
 - the process stays named `nixlock`, so `pkill -USR1 nixlock` reaches it, and
-  `SIGUSR1` re-shows the password indicator (swaylock's own convention).
+  `SIGUSR1` is handled: it is never fatal, and it repaints -- re-showing the
+  password indicator -- within one tick (<=1s). It touches no auth state.
 - per-host values swayidle cannot pass on the command line -- kiosk outputs, the
   PAM service, the kiosk socket path -- are read from
   `$XDG_CONFIG_HOME/nixlock/config.json`, which the home-manager module renders.
