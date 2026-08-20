@@ -8,7 +8,16 @@
   outputs = { self, nixpkgs }:
     let
       lib = nixpkgs.lib;
-      supportedSystems = [ "x86_64-linux" "aarch64-linux" ];
+      # x86_64-linux only, and narrow ON PURPOSE. Declaring aarch64 here made CI a lie waiting to
+      # happen: `nix flake check` without `--all-systems` silently evaluates only the runner's own
+      # system and exits 0, so the extra platform reads as covered while nothing ever built it. And
+      # it genuinely cannot be built from a normal runner -- `nix build .#checks.aarch64-linux.
+      # eval-checks` on x86_64 fails outright with "platform mismatch", so the strict form would
+      # simply be red. No host on this fleet is aarch64 either.
+      #
+      # Narrow the claim rather than weaken the check: the same call this repo's own
+      # `the_socket_module_has_no_route_to_authentication_or_unlock` makes about coverage.
+      supportedSystems = [ "x86_64-linux" ];
       forAllSystems = lib.genAttrs supportedSystems;
       pkgsFor = system: import nixpkgs { inherit system; };
     in
@@ -45,7 +54,10 @@
       # service appears when enabled and is absent when not -- the fail-closed
       # guarantee BEHAVIORS.md AUTH-3 names). The Rust crate's own behaviour is
       # exercised by `cargo test` in-derivation (`nix build .#nixlock`); these
-      # are the Nix half.
+      # are the Nix half: 17 tests over the kiosk display socket's wire protocol and frame
+      # acceptance (DISPLAY-1/DISPLAY-2) and over the output-role default (an output nobody
+      # configured is a lock screen, never a kiosk). CI runs both halves -- see
+      # .github/workflows/ci.yml.
       checks = forAllSystems (system:
         import ./checks {
           pkgs = pkgsFor system;

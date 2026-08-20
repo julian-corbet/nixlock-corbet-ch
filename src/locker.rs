@@ -442,11 +442,7 @@ impl SessionLockHandler for Locker {
                 let info = self.output_state.info(&o);
                 let name = info.as_ref().and_then(|i| i.name.clone()).unwrap_or_default();
                 let scale = info.as_ref().map(|i| i.scale_factor.max(1) as u32).unwrap_or(1);
-                let role = if self.kiosk_outputs.iter().any(|k| k == &name) {
-                    OutputRole::Kiosk
-                } else {
-                    OutputRole::Session
-                };
+                let role = crate::content::role_for(&self.kiosk_outputs, &name);
                 (o, name, role, scale)
             })
             .collect();

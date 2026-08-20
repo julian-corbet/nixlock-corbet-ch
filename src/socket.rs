@@ -207,3 +207,333 @@ fn read_frames(mut stream: UnixStream, my_gen: u64, state: Arc<SocketState>) {
         eprintln!("nixlock: socket: client disconnected; kiosk falls back to the default clock");
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    /// Drive `read_frames` exactly as production does -- on its own thread, against a real
+    /// `UnixStream` pair. Returns the writable client end and a join handle.
+    fn serve(state: &Arc<SocketState>) -> (UnixStream, std::thread::JoinHandle<()>) {
+        let (client, server) = UnixStream::pair().unwrap();
+        let my_gen = state.active_gen.fetch_add(1, Ordering::SeqCst) + 1;
+        let st = Arc::clone(state);
+        let h = std::thread::spawn(move || read_frames(server, my_gen, st));
+        (client, h)
+    }
+
+    fn frame(width: u32, height: u32, fill: u8) -> Vec<u8> {
+        let mut v = Vec::new();
+        v.extend_from_slice(&width.to_le_bytes());
+        v.extend_from_slice(&height.to_le_bytes());
+        v.resize(8 + (width as usize) * (height as usize) * 4, fill);
+        v
+    }
+
+    /// These are threaded handoffs, so the assertion is "reaches this state within a bound",
+    /// never a fixed sleep.
+    fn within<F: Fn() -> bool>(f: F) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if f() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        false
+    }
+
+    fn latest_fill(state: &SocketState) -> Option<u8> {
+        state.latest.lock().unwrap().as_ref().map(|f| f.rgba[0])
+    }
+
+    /// Nothing becomes visible for a bounded window. A negative observation, not a proof of never
+    /// -- but the accepting path above lands in single-digit milliseconds, so a frame that has not
+    /// appeared in 300ms was rejected, not merely slow.
+    ///
+    /// It has to be observed WHILE THE CLIENT IS STILL CONNECTED. Asserting `latest.is_none()`
+    /// after a disconnect proves nothing at all, because disconnecting is itself defined to clear
+    /// the frame -- a mutation that deleted the geometry check entirely passed that way.
+    fn stays_empty(state: &SocketState) -> bool {
+        let deadline = Instant::now() + Duration::from_millis(300);
+        while Instant::now() < deadline {
+            if state.latest.lock().unwrap().is_some() {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        true
+    }
+
+    // ── DISPLAY-1 ────────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn a_frame_matching_the_kiosk_geometry_is_accepted() {
+        let state = SocketState::new();
+        state.set_geometry(4, 2, 1);
+        let (mut client, h) = serve(&state);
+
+        client.write_all(&frame(4, 2, 0xAB)).unwrap();
+        assert!(within(|| latest_fill(&state) == Some(0xAB)), "frame was never accepted");
+        let held = state.latest.lock().unwrap();
+        let f = held.as_ref().unwrap();
+        assert_eq!((f.width, f.height), (4, 2));
+        assert_eq!(f.rgba.len(), 4 * 2 * 4, "payload must be exactly w*h*4");
+        drop(held);
+
+        drop(client);
+        h.join().unwrap();
+    }
+
+    // The kiosk must fall back to the built-in clock the moment the streaming client goes away --
+    // never keep painting a frozen last frame on a locked machine.
+    #[test]
+    fn a_disconnect_clears_the_frame_so_the_kiosk_falls_back_to_the_clock() {
+        let state = SocketState::new();
+        state.set_geometry(4, 2, 1);
+        let (mut client, h) = serve(&state);
+
+        client.write_all(&frame(4, 2, 0x11)).unwrap();
+        assert!(within(|| latest_fill(&state) == Some(0x11)));
+
+        drop(client);
+        h.join().unwrap();
+        assert!(state.latest.lock().unwrap().is_none(), "stale frame survived the disconnect");
+    }
+
+    // A mismatched frame is DROPPED, not fatal: the connection must survive it, which is why the
+    // second (matching) frame has to land on the same stream.
+    #[test]
+    fn a_wrong_geometry_frame_is_dropped_and_the_connection_is_kept() {
+        let state = SocketState::new();
+        state.set_geometry(4, 2, 1);
+        let (mut client, h) = serve(&state);
+
+        // Sent ALONE and checked before anything else is written: sending a good frame after it
+        // and inspecting the result cannot distinguish "the bad one was dropped" from "the bad one
+        // was accepted and then overwritten".
+        client.write_all(&frame(8, 2, 0x22)).unwrap();
+        assert!(
+            stays_empty(&state),
+            "a frame whose geometry does not match the kiosk output was blitted"
+        );
+
+        // The drop must not have killed the connection -- the same stream still works.
+        client.write_all(&frame(4, 2, 0x33)).unwrap();
+        assert!(
+            within(|| latest_fill(&state) == Some(0x33)),
+            "the connection did not survive a dropped frame"
+        );
+
+        drop(client);
+        h.join().unwrap();
+    }
+
+    #[test]
+    fn no_frame_ever_sent_means_no_frame_to_show() {
+        let state = SocketState::new();
+        state.set_geometry(4, 2, 1);
+        let (client, h) = serve(&state);
+        drop(client);
+        h.join().unwrap();
+        assert!(state.latest.lock().unwrap().is_none());
+    }
+
+    // A frame that arrives before the compositor has configured the kiosk surface (geometry still
+    // 0,0,0) cannot match anything, so it must be dropped rather than blitted at a guessed size.
+    #[test]
+    fn a_frame_arriving_before_the_kiosk_has_geometry_is_dropped() {
+        let state = SocketState::new();
+        let (mut client, h) = serve(&state);
+
+        client.write_all(&frame(4, 2, 0x44)).unwrap();
+        assert!(
+            stays_empty(&state),
+            "a frame was blitted at a guessed size before the compositor configured the kiosk"
+        );
+
+        drop(client);
+        h.join().unwrap();
+    }
+
+    // ── defensive length handling ────────────────────────────────────────────────────────────
+
+    // A garbled or hostile length prefix must not become a huge allocation: the header alone has
+    // to end the connection, WITHOUT the payload ever being read.
+    //
+    // Asserted as "the client observes EOF while it is still connected and has sent no payload".
+    // The obvious alternative -- send a header and check the handler exited -- cannot fail: if the
+    // cap were gone the handler would block in `read_exact` forever and the test would HANG rather
+    // than fail. A read timeout turns that same mutation into a clean failure.
+    //
+    // Sized just past the cap on purpose. At 0xFFFF x 0xFFFF a removed cap aborts the test process
+    // on a ~17 GiB reservation, which is also not a legible failure.
+    #[test]
+    fn an_implausibly_large_frame_closes_the_connection_without_reading_the_payload() {
+        const W: u32 = 4097;
+        const H: u32 = 4096;
+        assert!(
+            (W as usize) * (H as usize) * 4 > MAX_FRAME_BYTES,
+            "this test is only meaningful above the cap"
+        );
+
+        let state = SocketState::new();
+        state.set_geometry(4, 2, 1);
+        let (mut client, h) = serve(&state);
+
+        let mut header = Vec::new();
+        header.extend_from_slice(&W.to_le_bytes());
+        header.extend_from_slice(&H.to_le_bytes());
+        client.write_all(&header).unwrap();
+
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut sink = [0u8; 1];
+        assert_eq!(
+            client.read(&mut sink).ok(),
+            Some(0),
+            "the server should have closed on the header alone; it is still reading the payload"
+        );
+
+        h.join().unwrap();
+        assert!(state.latest.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn a_zero_sized_frame_closes_the_connection() {
+        let state = SocketState::new();
+        state.set_geometry(4, 2, 1);
+        let (mut client, h) = serve(&state);
+        let _ = client.write_all(&[0u8; 8]);
+        h.join().unwrap();
+        assert!(state.latest.lock().unwrap().is_none());
+    }
+
+    // A stream that ends mid-payload cannot be resynchronized, so it is treated exactly like a
+    // disconnect -- and must not leave a half-read buffer on screen.
+    #[test]
+    fn a_truncated_frame_is_treated_as_a_disconnect() {
+        let state = SocketState::new();
+        state.set_geometry(4, 2, 1);
+        let (mut client, h) = serve(&state);
+
+        let full = frame(4, 2, 0x55);
+        client.write_all(&full[..full.len() - 4]).unwrap();
+        drop(client);
+
+        h.join().unwrap();
+        assert!(state.latest.lock().unwrap().is_none(), "a partial buffer must never be shown");
+    }
+
+    // ── one client at a time ─────────────────────────────────────────────────────────────────
+
+    // A superseded connection's handler exits late. It must not clear the frame the NEW connection
+    // has already published, which would blink the kiosk back to the clock for no reason.
+    #[test]
+    fn a_superseded_connection_does_not_clear_the_newer_frame() {
+        let state = SocketState::new();
+        state.set_geometry(4, 2, 1);
+
+        let (client_old, h_old) = serve(&state);
+        // A newer connection takes over the generation while the old handler is still alive.
+        state.active_gen.fetch_add(1, Ordering::SeqCst);
+        *state.latest.lock().unwrap() = Some(LatestFrame {
+            width: 4,
+            height: 2,
+            rgba: vec![0x66; 4 * 2 * 4],
+        });
+
+        drop(client_old);
+        h_old.join().unwrap();
+
+        assert_eq!(
+            latest_fill(&state),
+            Some(0x66),
+            "the old connection's exit stomped the live frame"
+        );
+    }
+
+    // ── HELLO wire format ────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn hello_is_the_magic_then_three_little_endian_u32s() {
+        let (mut server, mut client) = UnixStream::pair().unwrap();
+        write_hello(&mut server, 3840, 2160, 2).unwrap();
+        drop(server);
+
+        let mut got = Vec::new();
+        client.read_to_end(&mut got).unwrap();
+
+        assert_eq!(got.len(), 20, "HELLO is 8 magic + 3 u32");
+        assert_eq!(&got[0..8], MAGIC);
+        assert_eq!(u32::from_le_bytes(got[8..12].try_into().unwrap()), 3840);
+        assert_eq!(u32::from_le_bytes(got[12..16].try_into().unwrap()), 2160);
+        assert_eq!(u32::from_le_bytes(got[16..20].try_into().unwrap()), 2);
+    }
+
+    // `0,0,0` is the documented "no kiosk output" answer a client must be able to distinguish.
+    #[test]
+    fn hello_reports_zero_geometry_when_there_is_no_kiosk_output() {
+        let (mut server, mut client) = UnixStream::pair().unwrap();
+        let (w, h, s) = *SocketState::new().geometry.lock().unwrap();
+        write_hello(&mut server, w, h, s).unwrap();
+        drop(server);
+
+        let mut got = Vec::new();
+        client.read_to_end(&mut got).unwrap();
+        assert_eq!(&got[8..20], &[0u8; 12]);
+    }
+
+    // ── DISPLAY-2 ────────────────────────────────────────────────────────────────────────────
+
+    // The socket is display-only, permanently. Asserted against the module's own source rather
+    // than a comment, so that ADDING a path from received bytes to the password buffer, the auth
+    // state, or the unlock call fails the build instead of a review.
+    //
+    // Scoped to the code above `#[cfg(test)]`: this test module necessarily says these words.
+    #[test]
+    fn the_socket_module_has_no_route_to_authentication_or_unlock() {
+        let source = include_str!("socket.rs");
+        let code = source.split("#[cfg(test)]").next().unwrap();
+        let stripped: String = code
+            .lines()
+            .map(|l| match l.find("//") {
+                Some(i) => &l[..i],
+                None => l,
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+            .to_lowercase();
+
+        for forbidden in ["unlock", "password", "pam", "auth"] {
+            assert!(
+                !stripped.contains(forbidden),
+                "socket.rs code references `{forbidden}`: the kiosk display socket must never be \
+                 able to reach authentication or the unlock call (BEHAVIORS.md DISPLAY-2)"
+            );
+        }
+    }
+
+    // ── resolve_path ─────────────────────────────────────────────────────────────────────────
+    //
+    // These mutate a process-global env var, so they are one test rather than three racing ones.
+    #[test]
+    fn resolve_path_prefers_the_configured_value_then_xdg_then_gives_up() {
+        let configured = Path::new("/run/custom/nixlock.sock");
+
+        std::env::set_var("XDG_RUNTIME_DIR", "/run/user/1000");
+        assert_eq!(resolve_path(Some(configured)).unwrap(), configured);
+        assert_eq!(
+            resolve_path(None).unwrap(),
+            PathBuf::from("/run/user/1000/nixlock.sock")
+        );
+
+        std::env::remove_var("XDG_RUNTIME_DIR");
+        // No socket is a silent degrade to the built-in clock, never a startup failure -- a
+        // display feature must not be able to stop the lock from coming up.
+        assert!(resolve_path(None).is_none());
+        assert_eq!(resolve_path(Some(configured)).unwrap(), configured);
+    }
+}
