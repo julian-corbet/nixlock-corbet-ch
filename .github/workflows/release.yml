@@ -1,0 +1,90 @@
+name: release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing version tag to build and publish (for example, v0.1.1)
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  arch-artifact:
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+    timeout-minutes: 30
+    env:
+      RELEASE_TAG: ${{ inputs.tag }}
+    steps:
+      - name: Install the Arch-native build floor
+        run: >-
+          pacman -Syu --needed --noconfirm
+          cargo clang git github-cli libxkbcommon pam pkgconf rust wayland
+
+      - name: Build and verify the exact tag
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git clone "https://github.com/${GITHUB_REPOSITORY}.git" source
+          cd source
+          git checkout --detach "${RELEASE_TAG}"
+
+          test "$(git describe --tags --exact-match)" = "${RELEASE_TAG}"
+          version="${RELEASE_TAG#v}"
+          crate_version=$(awk -F'"' '/^version = / { print $2; exit }' Cargo.toml)
+          test "${crate_version}" = "${version}"
+
+          export RUSTFLAGS="-C opt-level=3 -C target-cpu=x86-64-v3"
+          cargo test --locked --release
+          cargo build --locked --release
+
+          readelf -d target/release/nixlock | grep -q 'Shared library: \[libpam.so.0\]'
+          interpreter=$(readelf -l target/release/nixlock |
+            sed -n 's/.*Requesting program interpreter: \(.*\)]/\1/p')
+          case "${interpreter}" in
+            /lib64/*|/usr/lib/*) ;;
+            *)
+              echo "non-system ELF interpreter: ${interpreter}" >&2
+              exit 1
+              ;;
+          esac
+          pam_path=$(ldd target/release/nixlock |
+            awk '/libpam.so.0/ { print $3; exit }')
+          case "${pam_path}" in
+            /usr/lib/libpam.so.0) ;;
+            *)
+              echo "non-system PAM resolution: ${pam_path}" >&2
+              exit 1
+              ;;
+          esac
+
+          artifact="nixlock-${version}-x86_64-v3.tar.gz"
+          install -Dm755 target/release/nixlock dist/nixlock
+          install -Dm644 LICENSE dist/LICENSE
+          tar -C dist -czf "${artifact}" nixlock LICENSE
+          sha256sum "${artifact}" > "${artifact}.sha256"
+
+          printf '%s\n' \
+            "Prebuilt x86-64-v3 binary linked against Arch system libpam." \
+            "Includes credential-safe unlock diagnostics and the SIGUSR1 locker-survival fix." \
+            > release-notes.md
+
+      - name: Publish the GitHub release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          cd source
+          version="${RELEASE_TAG#v}"
+          artifact="nixlock-${version}-x86_64-v3.tar.gz"
+          gh release create "${RELEASE_TAG}" \
+            "${artifact}" "${artifact}.sha256" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --verify-tag \
+            --title "nixlock ${version}" \
+            --notes-file release-notes.md
