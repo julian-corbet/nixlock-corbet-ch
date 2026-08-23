@@ -151,35 +151,29 @@ fn authenticate_once(
     // itself, and this is the only long-lived copy of the plaintext there ever was.
 }
 
-/// Verbose one-shot auth check for `nixlock --check-auth`: runs the exact auth path and prints
-/// which PAM stage fails and its error code. Never prints the password (only its length).
+fn emit_auth_diagnostic(
+    service: &str,
+    (outcome, stage, code): (AuthOutcome, AuthStage, Option<pam_client::ErrorCode>),
+) {
+    match code {
+        Some(code) => eprintln!(
+            "nixlock[diag]: service={service:?} outcome={} stage={} code={code:?}",
+            outcome.label(),
+            stage.label()
+        ),
+        None => eprintln!(
+            "nixlock[diag]: service={service:?} outcome={} stage={} code=SUCCESS",
+            outcome.label(),
+            stage.label()
+        ),
+    }
+}
+
+/// One-shot auth check for `nixlock --check-auth`: runs the exact live unlock path and prints only
+/// the configured service, outcome, failing stage, and symbolic PAM code.
 pub fn diagnose(service: &str, user: &str, password: String) {
-    use pam_client::{Context, Flag};
-    eprintln!("nixlock[diag]: service={service:?} user={user:?} pw_len={}", password.len());
-    let conv = PasswordConversation {
-        password: Zeroizing::new(password),
-    };
-    let mut ctx = match Context::new(service, Some(user), conv) {
-        Ok(c) => {
-            eprintln!("nixlock[diag]: Context::new OK");
-            c
-        }
-        Err(e) => {
-            eprintln!("nixlock[diag]: Context::new FAILED: {e}");
-            return;
-        }
-    };
-    match ctx.authenticate(Flag::NONE) {
-        Ok(()) => eprintln!("nixlock[diag]: authenticate() OK"),
-        Err(e) => {
-            eprintln!("nixlock[diag]: authenticate() FAILED code={:?}: {e}", e.code());
-            return;
-        }
-    }
-    match ctx.acct_mgmt(Flag::NONE) {
-        Ok(()) => eprintln!("nixlock[diag]: acct_mgmt() OK  =>  WOULD UNLOCK"),
-        Err(e) => eprintln!("nixlock[diag]: acct_mgmt() FAILED code={:?}: {e}", e.code()),
-    }
+    let result = authenticate_once(service, user, Zeroizing::new(password));
+    emit_auth_diagnostic(service, result);
 }
 
 /// Spawns the persistent auth worker. Keeping it persistent lets `pam_faillock` counters and
@@ -220,5 +214,71 @@ mod tests {
         assert_eq!(AuthOutcome::Wrong.label(), "wrong");
         assert_eq!(AuthOutcome::MaxTries.label(), "max_tries");
         assert_eq!(AuthOutcome::Error.label(), "error");
+    }
+
+    fn function_source<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
+        source
+            .split_once(start)
+            .unwrap_or_else(|| panic!("missing function start: {start}"))
+            .1
+            .split_once(end)
+            .unwrap_or_else(|| panic!("missing function end: {end}"))
+            .0
+    }
+
+    #[test]
+    fn check_auth_cannot_log_credential_metadata() {
+        let production = include_str!("auth.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production auth source");
+        let authenticate = function_source(
+            production,
+            "fn authenticate_once",
+            "fn emit_auth_diagnostic",
+        );
+        let emitter = function_source(production, "fn emit_auth_diagnostic", "/// One-shot auth");
+        let diagnose = function_source(production, "pub fn diagnose", "/// Spawns");
+
+        assert!(!emitter.contains("password"));
+        for forbidden in [
+            "eprintln!",
+            "println!",
+            "dbg!",
+            "format!",
+            "write!",
+            "writeln!",
+            "tracing::",
+            "log::",
+            ".len(",
+            "pw_len",
+        ] {
+            for source in [authenticate, diagnose] {
+                assert!(
+                    !source.contains(forbidden),
+                    "check-auth can expose credential metadata through `{forbidden}`"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn check_auth_reuses_the_live_authentication_primitive() {
+        let production = include_str!("auth.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production auth source");
+        let diagnose = function_source(production, "pub fn diagnose", "/// Spawns");
+
+        assert_eq!(diagnose.matches("authenticate_once(").count(), 1);
+        for duplicated_pam_call in ["Context::new(", ".authenticate(", ".acct_mgmt("] {
+            assert!(
+                !diagnose.contains(duplicated_pam_call),
+                "check-auth duplicates live PAM semantics through `{duplicated_pam_call}`"
+            );
+        }
+        assert_eq!(production.matches("Context::new(").count(), 1);
+        assert_eq!(production.matches(".authenticate(").count(), 1);
+        assert_eq!(production.matches(".acct_mgmt(").count(), 0);
     }
 }
