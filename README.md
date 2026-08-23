@@ -169,6 +169,27 @@ naming the missing service, and never falls back to another one (AUTH-3). The
 typed password lives only in a zeroizing buffer and is never logged, stored, or
 put in an error (AUTH-1). Keyboard input is decoded through libxkbcommon.
 
+## Debugging an unlock
+
+Set `nixlock.debug = true` in the home-manager module, put `"debug": true` in
+`$XDG_CONFIG_HOME/nixlock/config.json`, or invoke `nixlock --debug`. Debug mode writes structured
+events to stderr, which the seated session's systemd user unit captures in journald. It records the
+lock lifecycle, output configuration and keyboard focus, an opaque attempt number, PAM stage/result
+code and duration, the UI failure/backoff transition, and the compositor unlock request/flush.
+
+It never records password content or length, keystrokes/key symbols, PAM prompts, or PAM message
+text. On a systemd user session, inspect the current boot with:
+
+```bash
+journalctl -b _SYSTEMD_USER_UNIT=idle.service --grep='nixlock' \
+  -o short-monotonic --no-pager
+```
+
+The worker emits `pam_finished` before the Wayland loop receives `auth_result_received`. If the
+former exists without the latter, the event loop stalled; if both report `unlocked` but
+`unlock_flushed` reports an error, the Wayland connection failed; a named PAM code distinguishes a
+wrong password from a missing/unavailable auth service without exposing credential material.
+
 ## swaylock compatibility
 
 The default binary is a drop-in for the contract swayidle already speaks:

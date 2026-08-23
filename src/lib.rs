@@ -19,6 +19,7 @@
 //!     pam_service: "nixlock".into(),
 //!     username: None,
 //!     socket_path: None, // default: $XDG_RUNTIME_DIR/nixlock.sock
+//!     debug: false,
 //! }).unwrap();
 //! ```
 //!
@@ -29,6 +30,7 @@
 
 mod auth;
 mod content;
+mod diagnostics;
 mod locker;
 mod lockscreen;
 mod socket;

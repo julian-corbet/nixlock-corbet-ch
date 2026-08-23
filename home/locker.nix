@@ -69,6 +69,18 @@ in
       '';
     };
 
+    debug = lib.mkOption {
+      type = lib.types.bool;
+      default = false;
+      description = ''
+        Emit credential-blind locker lifecycle and PAM result events to stderr.
+        The seated session's systemd user unit captures them in journald. The
+        diagnostic stream never includes password content or length, key
+        symbols, PAM prompts, or PAM message text. Keep this host-scoped and
+        enable it only while diagnosing a locker problem.
+      '';
+    };
+
     wireLockCommand = lib.mkOption {
       type = lib.types.bool;
       default = true;
@@ -128,6 +140,7 @@ in
         {
           kiosk_outputs = cfg.kioskOutputs;
           pam_service = cfg.pamService;
+          debug = cfg.debug;
         }
         // lib.optionalAttrs (cfg.kioskCommand != null) {
           kiosk_command = cfg.kioskCommand;

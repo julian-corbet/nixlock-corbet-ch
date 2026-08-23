@@ -5,9 +5,9 @@
 //! the latest frame from the kiosk display socket (`crate::socket`, run on its own thread here) or
 //! the same built-in clock whenever the socket has nothing current for it.
 
-use crate::auth::{self, AuthOutcome};
-use std::sync::atomic::{AtomicBool, Ordering};
+use crate::auth::{self, AuthAttempt, AuthOutcome, AuthResult};
 use crate::content::{AuthState, AuthView, Frame, KioskContent, OutputRole};
+use crate::diagnostics::Diagnostics;
 use crate::lockscreen::ClockLockScreen;
 use crate::socket::{self, SocketState};
 use calloop::{
@@ -36,6 +36,7 @@ use smithay_client_toolkit::{
 };
 use std::path::PathBuf;
 use std::sync::{mpsc, Arc};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use wayland_client::{
     globals::registry_queue_init,
@@ -60,6 +61,10 @@ pub struct Config {
     /// feature must never block or weaken the lock itself. See `crate::socket` for the wire
     /// protocol a client streams frames over.
     pub socket_path: Option<PathBuf>,
+    /// Emit credential-blind lifecycle and PAM result events to stderr. The seated session's
+    /// systemd unit captures stderr in journald. No password content, length, key symbol, PAM
+    /// prompt, or PAM message is ever included.
+    pub debug: bool,
 }
 
 #[non_exhaustive]
@@ -104,7 +109,12 @@ extern "C" fn on_sigusr1(_sig: libc::c_int) {
 fn install_sigusr1_handler() -> bool {
     // SAFETY: `on_sigusr1` is `extern "C"`, does nothing but an atomic store, and the handler is
     // installed once before the event loop runs.
-    unsafe { libc::signal(libc::SIGUSR1, on_sigusr1 as libc::sighandler_t) != libc::SIG_ERR }
+    unsafe {
+        libc::signal(
+            libc::SIGUSR1,
+            on_sigusr1 as *const () as libc::sighandler_t,
+        ) != libc::SIG_ERR
+    }
 }
 
 /// The entrypoint. Locks now: the built-in [`ClockLockScreen`] on `Session` outputs, and on
@@ -142,6 +152,8 @@ impl Builder {
 }
 
 fn run_inner(config: Config, session_content: Box<dyn KioskContent>) -> Result<(), LockError> {
+    let diagnostics = Diagnostics::new(config.debug);
+    diagnostics.startup();
     // Before anything else, so a signal arriving during startup cannot kill a locker that has
     // already told the compositor to lock.
     if !install_sigusr1_handler() {
@@ -158,6 +170,7 @@ fn run_inner(config: Config, session_content: Box<dyn KioskContent>) -> Result<(
     );
 
     let conn = Connection::connect_to_env().map_err(|e| LockError::Wayland(e.to_string()))?;
+    diagnostics.wayland_connected();
     let (globals, mut event_queue) =
         registry_queue_init(&conn).map_err(|e| LockError::Wayland(e.to_string()))?;
     let qh: QueueHandle<Locker> = event_queue.handle();
@@ -169,9 +182,15 @@ fn run_inner(config: Config, session_content: Box<dyn KioskContent>) -> Result<(
     let seat_state = SeatState::new(&globals, &qh);
     let session_lock_state = SessionLockState::new(&globals, &qh);
 
-    let (attempt_tx, attempt_rx) = mpsc::channel::<Zeroizing<String>>();
-    let (result_tx, result_ch) = channel::<AuthOutcome>();
-    auth::spawn(config.pam_service.clone(), username, attempt_rx, result_tx);
+    let (attempt_tx, attempt_rx) = mpsc::channel::<AuthAttempt>();
+    let (result_tx, result_ch) = channel::<AuthResult>();
+    auth::spawn(
+        config.pam_service.clone(),
+        username,
+        attempt_rx,
+        result_tx,
+        diagnostics.clone(),
+    );
 
     // The kiosk display socket. Best-effort and DISPLAY-ONLY (DISPLAY-2): a bind failure here
     // never fails the lock, it just means the kiosk output shows the built-in clock forever —
@@ -207,6 +226,8 @@ fn run_inner(config: Config, session_content: Box<dyn KioskContent>) -> Result<(
         attempt_tx,
         fail_count: 0,
         locked_until: None,
+        next_attempt_id: 1,
+        diagnostics,
     };
 
     event_queue
@@ -220,6 +241,7 @@ fn run_inner(config: Config, session_content: Box<dyn KioskContent>) -> Result<(
         .session_lock_state
         .lock(&qh)
         .map_err(|_| LockError::NoSessionLockProtocol)?;
+    locker.diagnostics.lock_requested();
     locker.lock = Some(lock);
 
     let mut event_loop: EventLoop<Locker> =
@@ -242,6 +264,7 @@ fn run_inner(config: Config, session_content: Box<dyn KioskContent>) -> Result<(
             // below is the entire effect.
             if SIGUSR1_SEEN.swap(false, Ordering::Relaxed) {
                 eprintln!("nixlock: SIGUSR1: re-showing the password indicator");
+                l.diagnostics.sigusr1();
             }
             l.redraw_all();
             TimeoutAction::ToDuration(Duration::from_secs(1))
@@ -309,7 +332,7 @@ struct Locker {
     caps_lock: bool,
     failed: bool,
     verifying: bool,
-    attempt_tx: mpsc::Sender<Zeroizing<String>>,
+    attempt_tx: mpsc::Sender<AuthAttempt>,
     /// Consecutive `Wrong`/`MaxTries`/`Error` verdicts since the last (never-happened, since a
     /// success exits) reset. Drives the backoff delay below.
     fail_count: u32,
@@ -318,6 +341,8 @@ struct Locker {
     /// than the delay. Cleared once expiry is observed (checked lazily, and swept by the existing
     /// 1s repaint timer) — never a lockout (`SESSION-1`: always retryable, just not instantly).
     locked_until: Option<Instant>,
+    next_attempt_id: u64,
+    diagnostics: Diagnostics,
 }
 
 impl Locker {
@@ -437,24 +462,56 @@ impl Locker {
     }
 
     fn submit(&mut self) {
-        if self.verifying || self.backoff_active() || self.password.is_empty() {
+        if self.verifying {
+            self.diagnostics.submit_ignored("verification_in_flight");
             return;
         }
+        if self.backoff_active() {
+            self.diagnostics.submit_ignored("backoff_active");
+            return;
+        }
+        if self.password.is_empty() {
+            self.diagnostics.submit_ignored("empty_input");
+            return;
+        }
+        let attempt_id = self.next_attempt_id;
+        self.next_attempt_id = self.next_attempt_id.saturating_add(1);
         let pw = std::mem::take(&mut self.password);
         self.verifying = true;
         self.failed = false;
         self.redraw_locks();
-        let _ = self.attempt_tx.send(pw);
+        self.diagnostics.auth_submitted(attempt_id);
+        if self
+            .attempt_tx
+            .send(AuthAttempt {
+                id: attempt_id,
+                password: pw,
+            })
+            .is_err()
+        {
+            self.diagnostics.auth_delivery_failed(attempt_id);
+            self.verifying = false;
+            self.failed = true;
+            self.redraw_locks();
+        }
     }
 
-    fn on_auth(&mut self, outcome: AuthOutcome) {
+    fn on_auth(&mut self, result: AuthResult) {
+        let AuthResult { id, outcome } = result;
+        self.diagnostics.auth_result_received(id, outcome);
         self.verifying = false;
         match outcome {
             AuthOutcome::Unlocked => {
+                self.diagnostics.unlock_requested(id);
                 if let Some(lock) = self.lock.take() {
                     lock.unlock();
                 }
-                let _ = self.conn.flush(); // push unlock_and_destroy before exit
+                let flushed = self.conn.flush(); // push unlock_and_destroy before exit
+                self.diagnostics.unlock_flushed(flushed.is_ok());
+                if let Err(e) = flushed {
+                    eprintln!("nixlock: unlock flush failed: {e}");
+                }
+                self.diagnostics.authenticated_exit(id);
                 std::process::exit(0);
             }
             AuthOutcome::Wrong | AuthOutcome::MaxTries | AuthOutcome::Error => {
@@ -465,6 +522,7 @@ impl Locker {
                 self.fail_count = self.fail_count.saturating_add(1);
                 let delay = Duration::from_secs(self.fail_count.min(5) as u64);
                 self.locked_until = Some(Instant::now() + delay);
+                self.diagnostics.auth_failed_ui(id, delay);
                 self.redraw_locks();
             }
         }
@@ -488,6 +546,7 @@ impl SessionLockHandler for Locker {
             .collect();
         ordered.sort_by_key(|(_, _, role, _)| *role == OutputRole::Kiosk); // Session (false) first
         eprintln!("nixlock: locked; {} output(s)", ordered.len());
+        self.diagnostics.lock_acquired(ordered.len());
         for (output, name, role, scale) in ordered {
             let surface = self.compositor.create_surface(qh);
             let lock_surface = session_lock.create_lock_surface(surface, &output, qh);
@@ -505,6 +564,7 @@ impl SessionLockHandler for Locker {
 
     fn finished(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _lock: SessionLock) {
         eprintln!("nixlock: lock finished/rejected");
+        self.diagnostics.lock_finished();
         std::process::exit(1);
     }
 
@@ -524,6 +584,13 @@ impl SessionLockHandler for Locker {
         {
             self.surfaces[idx].width = w;
             self.surfaces[idx].height = h;
+            self.diagnostics.surface_configured(
+                &self.surfaces[idx].name,
+                self.surfaces[idx].role,
+                w,
+                h,
+                self.surfaces[idx].scale,
+            );
             // The one (v1) kiosk output's geometry is what a connecting socket client's HELLO
             // reports, and what an already-connected client's frames are validated against — keep
             // it current on every configure, including a later resize.
@@ -542,6 +609,7 @@ impl SeatHandler for Locker {
     fn new_seat(&mut self, _: &Connection, _: &QueueHandle<Self>, _: WlSeat) {}
     fn new_capability(&mut self, _: &Connection, qh: &QueueHandle<Self>, seat: WlSeat, cap: Capability) {
         if cap == Capability::Keyboard && self.keyboard.is_none() {
+            self.diagnostics.keyboard_capability(true);
             match self.seat_state.get_keyboard(qh, &seat, None) {
                 Ok(kb) => self.keyboard = Some(kb),
                 Err(e) => eprintln!("nixlock: get_keyboard failed: {e}"),
@@ -550,6 +618,7 @@ impl SeatHandler for Locker {
     }
     fn remove_capability(&mut self, _: &Connection, _: &QueueHandle<Self>, _: WlSeat, cap: Capability) {
         if cap == Capability::Keyboard {
+            self.diagnostics.keyboard_capability(false);
             if let Some(kb) = self.keyboard.take() {
                 kb.release();
             }
@@ -559,8 +628,22 @@ impl SeatHandler for Locker {
 }
 
 impl KeyboardHandler for Locker {
-    fn enter(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlKeyboard, _: &wl_surface::WlSurface, _: u32, _: &[u32], _: &[Keysym]) {}
-    fn leave(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlKeyboard, _: &wl_surface::WlSurface, _: u32) {}
+    fn enter(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlKeyboard, surface: &wl_surface::WlSurface, _: u32, _: &[u32], _: &[Keysym]) {
+        let output = self
+            .surfaces
+            .iter()
+            .find(|entry| entry.surface.wl_surface() == surface)
+            .map(|entry| (entry.name.as_str(), entry.role));
+        self.diagnostics.keyboard_focus(true, output);
+    }
+    fn leave(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlKeyboard, surface: &wl_surface::WlSurface, _: u32) {
+        let output = self
+            .surfaces
+            .iter()
+            .find(|entry| entry.surface.wl_surface() == surface)
+            .map(|entry| (entry.name.as_str(), entry.role));
+        self.diagnostics.keyboard_focus(false, output);
+    }
     fn press_key(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlKeyboard, _: u32, event: KeyEvent) {
         if self.verifying || self.backoff_active() {
             return; // one attempt in flight (AUTH-2), or cooling down after a wrong one

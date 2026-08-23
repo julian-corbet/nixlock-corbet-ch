@@ -6,14 +6,28 @@
 
 use nixlock::{run, Config};
 
+#[derive(serde::Deserialize, Default)]
+struct FileCfg {
+    #[serde(default)]
+    kiosk_outputs: Vec<String>,
+    #[serde(default)]
+    pam_service: Option<String>,
+    #[serde(default)]
+    socket_path: Option<String>,
+    #[serde(default)]
+    debug: bool,
+}
+
 fn main() {
     if std::env::args().any(|a| a == "--check-auth") {
         return check_auth_mode();
     }
     let mut daemonize = false;
+    let mut debug = false;
     for a in std::env::args().skip(1) {
         match a.as_str() {
             "-f" | "--daemonize" => daemonize = true,
+            "--debug" => debug = true,
             "-h" | "--help" => return help(),
             "-v" | "--version" => return println!("nixlock {}", env!("CARGO_PKG_VERSION")),
             other => eprintln!("nixlock: ignoring unknown arg {other}"),
@@ -26,7 +40,9 @@ fn main() {
         eprintln!("nixlock: -f accepted (before-sleep daemonization is a TODO)");
     }
 
-    if let Err(e) = run(load_config()) {
+    let mut config = load_config();
+    config.debug |= debug;
+    if let Err(e) = run(config) {
         eprintln!("nixlock: fatal: {e}");
         std::process::exit(1);
     }
@@ -45,15 +61,6 @@ fn check_auth_mode() {
 }
 
 fn load_config() -> Config {
-    #[derive(serde::Deserialize, Default)]
-    struct FileCfg {
-        #[serde(default)]
-        kiosk_outputs: Vec<String>,
-        #[serde(default)]
-        pam_service: Option<String>,
-        #[serde(default)]
-        socket_path: Option<String>,
-    }
     let path = std::env::var("XDG_CONFIG_HOME")
         .map(|d| format!("{d}/nixlock/config.json"))
         .unwrap_or_else(|_| {
@@ -72,6 +79,7 @@ fn load_config() -> Config {
             .unwrap_or_else(|| "nixlock".to_string()),
         username: None,
         socket_path: file.socket_path.map(std::path::PathBuf::from),
+        debug: file.debug,
     }
 }
 
@@ -79,13 +87,14 @@ fn help() {
     println!(
         "nixlock — a Wayland session locker that keeps kiosk outputs live while locking the rest.\n\
          \n\
-         USAGE: nixlock [-f] [-h] [-v]\n\
+         USAGE: nixlock [-f] [--debug] [-h] [-v]\n\
            -f, --daemonize   swaylock-compatible flag (fork after lock; TODO)\n\
+               --debug       log credential-blind lifecycle and PAM result events\n\
            -h, --help        this help\n\
            -v, --version     print version\n\
          \n\
          CONFIG: $XDG_CONFIG_HOME/nixlock/config.json\n\
-           {{ kiosk_outputs: [..], pam_service: \"..\", socket_path: \"..\" }}\n\
+           {{ kiosk_outputs: [..], pam_service: \"..\", socket_path: \"..\", debug: false }}\n\
          \n\
          The default binary shows the clock lock screen on every `Session` output. A `Kiosk`\n\
          output shows whatever a client streams over the kiosk display Unix socket (DISPLAY-1) --\n\
@@ -93,4 +102,18 @@ fn help() {
          frame arrives / after the client disconnects. That socket is DISPLAY-ONLY: it can never\n\
          unlock the session (DISPLAY-2); unlock is PAM-only, exactly as on every Session output."
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn debug_mode_is_off_by_default_and_explicit_when_enabled() {
+        let default: FileCfg = serde_json::from_str("{}").unwrap();
+        let enabled: FileCfg = serde_json::from_str(r#"{"debug":true}"#).unwrap();
+
+        assert!(!default.debug);
+        assert!(enabled.debug);
+    }
 }

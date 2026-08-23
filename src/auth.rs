@@ -6,16 +6,55 @@
 //! the setuid `unix_chkpwd` to read `/etc/shadow` — that privilege lives in the audited pam helper,
 //! never in nixlock. nixlock must never be setuid.
 
+use crate::diagnostics::Diagnostics;
 use std::ffi::{CStr, CString};
 use std::sync::mpsc;
+use std::time::Instant;
 use zeroize::Zeroizing;
 
 /// Verdict sent worker -> loop. Never carries the password.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AuthOutcome {
     Unlocked,
     Wrong,
     MaxTries,
     Error,
+}
+
+impl AuthOutcome {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Unlocked => "unlocked",
+            Self::Wrong => "wrong",
+            Self::MaxTries => "max_tries",
+            Self::Error => "error",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AuthStage {
+    Context,
+    Authenticate,
+}
+
+impl AuthStage {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Context => "context",
+            Self::Authenticate => "authenticate",
+        }
+    }
+}
+
+pub(crate) struct AuthAttempt {
+    pub(crate) id: u64,
+    pub(crate) password: Zeroizing<String>,
+}
+
+pub(crate) struct AuthResult {
+    pub(crate) id: u64,
+    pub(crate) outcome: AuthOutcome,
 }
 
 /// A `pam_client::ConversationHandler` that answers PAM's password prompts straight out of a
@@ -70,13 +109,22 @@ impl pam_client::ConversationHandler for PasswordConversation {
 }
 
 /// One PAM attempt, built + run entirely on the worker thread (pam `Context` is `!Send`).
-fn authenticate_once(service: &str, user: &str, password: Zeroizing<String>) -> AuthOutcome {
-    use pam_client::{Context, Flag};
+fn authenticate_once(
+    service: &str,
+    user: &str,
+    password: Zeroizing<String>,
+) -> (AuthOutcome, AuthStage, Option<pam_client::ErrorCode>) {
+    use pam_client::{Context, ErrorCode, Flag};
 
     let conv = PasswordConversation { password };
     let mut ctx = match Context::new(service, Some(user), conv) {
         Ok(c) => c,
-        Err(_) => return AuthOutcome::Error, // service missing / init failed -> FAIL CLOSED (AUTH-3)
+        Err(e) => {
+            // Service missing / init failed -> FAIL CLOSED (AUTH-3). Preserve the code for the
+            // credential-blind debug event so a configuration error is distinguishable from a
+            // wrong secret without ever logging the secret or PAM's prompt text.
+            return (AuthOutcome::Error, AuthStage::Context, Some(e.code()));
+        }
     };
     // A screen locker re-opens an already-valid, already-logged-in session, so we gate ONLY on the
     // authentication phase (the password) and do NOT call pam_acct_mgmt. This matches swaylock and
@@ -85,14 +133,18 @@ fn authenticate_once(service: &str, user: &str, password: Zeroizing<String>) -> 
     // (observed: acct_mgmt returning AUTH_ERR after prior auth failures). SESSION-1 still holds:
     // only a correct password reaches AuthOutcome::Unlocked.
     match ctx.authenticate(Flag::NONE) {
-        Ok(()) => AuthOutcome::Unlocked,
+        Ok(()) => (AuthOutcome::Unlocked, AuthStage::Authenticate, None),
         Err(e) => {
-            use pam_client::ErrorCode::*;
-            match e.code() {
-                MAXTRIES => AuthOutcome::MaxTries,
-                AUTH_ERR | USER_UNKNOWN | CRED_INSUFFICIENT | AUTHINFO_UNAVAIL => AuthOutcome::Wrong,
+            let code = e.code();
+            let outcome = match code {
+                ErrorCode::MAXTRIES => AuthOutcome::MaxTries,
+                ErrorCode::AUTH_ERR
+                | ErrorCode::USER_UNKNOWN
+                | ErrorCode::CRED_INSUFFICIENT
+                | ErrorCode::AUTHINFO_UNAVAIL => AuthOutcome::Wrong,
                 _ => AuthOutcome::Error, // abort / conversation error -> FAIL CLOSED
-            }
+            };
+            (outcome, AuthStage::Authenticate, Some(code))
         }
     }
     // `ctx` (and the `PasswordConversation` it owns) drops here: the `Zeroizing<String>` wipes
@@ -136,17 +188,37 @@ pub fn diagnose(service: &str, user: &str, password: String) {
 pub fn spawn(
     service: String,
     user: String,
-    attempts: mpsc::Receiver<Zeroizing<String>>,
-    results: calloop::channel::Sender<AuthOutcome>,
+    attempts: mpsc::Receiver<AuthAttempt>,
+    results: calloop::channel::Sender<AuthResult>,
+    diagnostics: Diagnostics,
 ) {
     std::thread::spawn(move || {
-        while let Ok(pw) = attempts.recv() {
-            let outcome = authenticate_once(&service, &user, pw);
+        while let Ok(attempt) = attempts.recv() {
+            diagnostics.pam_started(attempt.id, &service, &user);
+            let started = Instant::now();
+            let (outcome, stage, code) = authenticate_once(&service, &user, attempt.password);
+            diagnostics.pam_finished(attempt.id, outcome, stage, code, started.elapsed());
             let done = matches!(outcome, AuthOutcome::Unlocked);
-            let _ = results.send(outcome);
+            let _ = results.send(AuthResult {
+                id: attempt.id,
+                outcome,
+            });
             if done {
                 break;
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn auth_outcomes_have_stable_credential_blind_labels() {
+        assert_eq!(AuthOutcome::Unlocked.label(), "unlocked");
+        assert_eq!(AuthOutcome::Wrong.label(), "wrong");
+        assert_eq!(AuthOutcome::MaxTries.label(), "max_tries");
+        assert_eq!(AuthOutcome::Error.label(), "error");
+    }
 }

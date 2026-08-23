@@ -149,6 +149,21 @@ Not: no lockout that bricks the session -- a wrong password is always retryable 
 re-shows the indicator (`COMPAT-1`) without touching auth state. Its handler stores one flag and
 returns; asserted against the handler's own source, so giving it auth state fails the build.
 
+## Diagnostics — enough evidence without credential material
+### DIAG-1 — debug mode identifies the failing stage and never logs the credential
+**GIVEN** debug mode is enabled and an unlock is attempted, **THEN** journald receives structured
+events for submission, PAM start/finish, delivery to the Wayland event loop, UI failure/backoff or
+the compositor unlock request, and process exit. Attempts are correlated by an opaque counter and
+PAM failures include only their stage, symbolic result code, and duration.
+
+Why: a cleared password field looks the same for a wrong password, an unavailable PAM service, a
+stalled event loop, and a failed Wayland flush. Those cases need separate evidence, including an
+event emitted directly by the PAM worker before the render loop handles its result.
+
+Not: diagnostics never receive or record password content or length, key symbols, PAM prompt text,
+or PAM message text. Debugging must not turn the most credential-sensitive process in the session
+into a credential recorder.
+
 ## Compatibility — the contract swayidle already speaks
 ### COMPAT-1 — swaylock-CLI compatible; `-f` daemonizes AFTER the lock is held; stays named `nixlock`
 **GIVEN** swayidle invoking `nixlock -f`, **THEN** the process stays named `nixlock` (so
