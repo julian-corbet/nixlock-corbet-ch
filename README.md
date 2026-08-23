@@ -194,10 +194,10 @@ wrong password from a missing/unavailable auth service without exposing credenti
 
 The default binary is a drop-in for the contract swayidle already speaks:
 
-- `nixlock -f` is accepted and **does not fork yet** -- it stays in the
-  foreground. swayidle spawns its commands detached, so idle-timeout locking
-  works; the `before-sleep` ordering guarantee (lock held before the system
-  suspends) is the part that is not yet honored. See COMPAT-1.
+- `nixlock -f` forks before creating any worker thread. The parent returns only
+  after the compositor confirms that the child holds the session lock, so
+  swayidle's `before-sleep` ordering is real; startup failures propagate as a
+  failed hook instead of reporting a lock that was never acquired. See COMPAT-1.
 - the process stays named `nixlock`, so `pkill -USR1 nixlock` reaches it, and
   `SIGUSR1` is handled: it is never fatal, and it repaints -- re-showing the
   password indicator -- within one tick (<=1s). It touches no auth state.

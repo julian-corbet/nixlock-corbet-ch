@@ -7,6 +7,7 @@
 
 use crate::auth::{self, AuthAttempt, AuthOutcome, AuthResult};
 use crate::content::{AuthState, AuthView, Frame, KioskContent, OutputRole};
+use crate::daemon::{self, ForkRole, ReadyNotifier};
 use crate::diagnostics::Diagnostics;
 use crate::lockscreen::ClockLockScreen;
 use crate::socket::{self, SocketState};
@@ -73,6 +74,8 @@ pub enum LockError {
     /// The compositor does not advertise `ext-session-lock-v1`; refuse loudly, never half-lock.
     NoSessionLockProtocol,
     Wayland(String),
+    /// The `-f` parent could not create its child or the child exited before acquiring the lock.
+    Daemonize(String),
 }
 
 impl std::fmt::Display for LockError {
@@ -80,6 +83,7 @@ impl std::fmt::Display for LockError {
         match self {
             LockError::NoSessionLockProtocol => write!(f, "compositor lacks ext-session-lock-v1"),
             LockError::Wayland(s) => write!(f, "wayland: {s}"),
+            LockError::Daemonize(s) => write!(f, "daemonize: {s}"),
         }
     }
 }
@@ -122,7 +126,27 @@ fn install_sigusr1_handler() -> bool {
 /// clock, until a frame arrives or after the streaming client disconnects. Blocks until the
 /// correct password unlocks the whole session.
 pub fn run(config: Config) -> Result<(), LockError> {
-    run_inner(config, Box::new(ClockLockScreen::new()))
+    run_inner(config, Box::new(ClockLockScreen::new()), None)
+}
+
+/// Fork before creating any worker threads, then return in the parent only after the child has
+/// acquired the compositor's session lock. This is the swaylock-compatible `-f` contract used by
+/// swayidle: a successful hook means the session is already secured, while the child continues to
+/// own the lock and authenticate the user.
+pub fn run_daemonized(config: Config) -> Result<(), LockError> {
+    match daemon::fork().map_err(|e| LockError::Daemonize(e.to_string()))? {
+        ForkRole::Parent(waiter) => waiter
+            .wait()
+            .map_err(|e| LockError::Daemonize(e.to_string())),
+        ForkRole::Child(ready) => {
+            let result = run_inner(config, Box::new(ClockLockScreen::new()), Some(ready));
+            if let Err(error) = result {
+                eprintln!("nixlock: fatal: {error}");
+                std::process::exit(1);
+            }
+            std::process::exit(0);
+        }
+    }
 }
 
 /// Full control — override the `Session` lock screen (the `Kiosk` fallback is always the shipped
@@ -147,11 +171,15 @@ impl Builder {
         let session = self
             .session
             .unwrap_or_else(|| Box::new(ClockLockScreen::new()));
-        run_inner(self.config, session)
+        run_inner(self.config, session, None)
     }
 }
 
-fn run_inner(config: Config, session_content: Box<dyn KioskContent>) -> Result<(), LockError> {
+fn run_inner(
+    config: Config,
+    session_content: Box<dyn KioskContent>,
+    daemon_ready: Option<ReadyNotifier>,
+) -> Result<(), LockError> {
     let diagnostics = Diagnostics::new(config.debug);
     diagnostics.startup();
     // Before anything else, so a signal arriving during startup cannot kill a locker that has
@@ -228,6 +256,7 @@ fn run_inner(config: Config, session_content: Box<dyn KioskContent>) -> Result<(
         locked_until: None,
         next_attempt_id: 1,
         diagnostics,
+        daemon_ready,
     };
 
     event_queue
@@ -343,6 +372,8 @@ struct Locker {
     locked_until: Option<Instant>,
     next_attempt_id: u64,
     diagnostics: Diagnostics,
+    /// Present only for `-f`; consumed once the compositor confirms the session lock is held.
+    daemon_ready: Option<ReadyNotifier>,
 }
 
 impl Locker {
@@ -559,6 +590,13 @@ impl SessionLockHandler for Locker {
                 height: 0,
                 scale,
             });
+        }
+        if let Some(ready) = self.daemon_ready.take() {
+            let notified = ready.notify().is_ok();
+            self.diagnostics.daemon_ready(notified);
+            if !notified {
+                eprintln!("nixlock: daemon parent disappeared before lock readiness was reported");
+            }
         }
     }
 

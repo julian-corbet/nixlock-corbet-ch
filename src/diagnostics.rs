@@ -47,6 +47,13 @@ impl Diagnostics {
         self.emit(format_args!("event=lock_acquired outputs={outputs}"));
     }
 
+    pub(crate) fn daemon_ready(&self, notified: bool) {
+        self.emit(format_args!(
+            "event=daemon_ready parent_notification={}",
+            if notified { "ok" } else { "error" }
+        ));
+    }
+
     pub(crate) fn surface_configured(
         &self,
         output: &str,

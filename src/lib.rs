@@ -30,6 +30,7 @@
 
 mod auth;
 mod content;
+mod daemon;
 mod diagnostics;
 mod locker;
 mod lockscreen;
@@ -37,7 +38,7 @@ mod socket;
 mod theme;
 
 pub use content::{AuthState, AuthView, Frame, KioskContent, OutputRole};
-pub use locker::{builder, run, Builder, Config, LockError};
+pub use locker::{builder, run, run_daemonized, Builder, Config, LockError};
 pub use lockscreen::ClockLockScreen;
 
 /// Verbose PAM auth check used by `nixlock --check-auth` (verify your PAM service works).

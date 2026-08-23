@@ -168,12 +168,10 @@ into a credential recorder.
 ### COMPAT-1 — swaylock-CLI compatible; `-f` daemonizes AFTER the lock is held; stays named `nixlock`
 **GIVEN** swayidle invoking `nixlock -f`, **THEN** the process stays named `nixlock` (so
 `pkill -USR1 nixlock` reaches it), and `SIGUSR1` is HANDLED: never fatal, and it repaints -- re-showing
-the password indicator -- within one repaint tick (<=1s), touching no auth state.
-
-**NOT YET TRUE, stated here rather than implied:** `-f` is accepted and does NOT fork; nixlock stays
-in the foreground. The intent above -- acquire the lock FIRST, then daemonize, so nothing is ordered
-ahead of an un-held lock -- is the target, not the behaviour. swayidle spawns commands detached, so
-idle-timeout locking works today; the `before-sleep` guarantee is what is missing.
+the password indicator -- within one repaint tick (<=1s), touching no auth state. The fork happens
+before any worker thread is created, but the parent does not return until the compositor confirms
+that the child holds the session lock. A startup failure closes that readiness channel and makes the
+parent fail rather than claiming an unsecured session is ready.
 
 Why SIGUSR1 is called out as a guarantee and not a nicety: its default disposition is TERMINATE, and
 the fleet's swayidle line ends `unlock 'pkill -USR1 nixlock'`. With no handler installed that signal

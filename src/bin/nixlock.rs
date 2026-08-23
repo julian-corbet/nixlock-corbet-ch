@@ -4,7 +4,7 @@
 //! the same built-in clock otherwise. Per-host values come from
 //! `$XDG_CONFIG_HOME/nixlock/config.json`, because swayidle only ever appends `-f`.
 
-use nixlock::{run, Config};
+use nixlock::{run, run_daemonized, Config};
 
 #[derive(serde::Deserialize, Default)]
 struct FileCfg {
@@ -33,16 +33,14 @@ fn main() {
             other => eprintln!("nixlock: ignoring unknown arg {other}"),
         }
     }
-    if daemonize {
-        // TODO: proper post-lock daemonization (fork after the lock is held, before any thread is
-        // spawned). For now we stay foreground; swayidle spawns commands detached, so idle-timeout
-        // locking works — only the `before-sleep` guarantee is not yet honored.
-        eprintln!("nixlock: -f accepted (before-sleep daemonization is a TODO)");
-    }
-
     let mut config = load_config();
     config.debug |= debug;
-    if let Err(e) = run(config) {
+    let result = if daemonize {
+        run_daemonized(config)
+    } else {
+        run(config)
+    };
+    if let Err(e) = result {
         eprintln!("nixlock: fatal: {e}");
         std::process::exit(1);
     }
@@ -88,7 +86,7 @@ fn help() {
         "nixlock — a Wayland session locker that keeps kiosk outputs live while locking the rest.\n\
          \n\
          USAGE: nixlock [-f] [--debug] [-h] [-v]\n\
-           -f, --daemonize   swaylock-compatible flag (fork after lock; TODO)\n\
+           -f, --daemonize   return after a child has acquired the session lock\n\
                --debug       log credential-blind lifecycle and PAM result events\n\
            -h, --help        this help\n\
            -v, --version     print version\n\
