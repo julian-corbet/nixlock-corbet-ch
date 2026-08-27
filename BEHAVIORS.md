@@ -97,6 +97,21 @@ Not: nixlock never executes, evaluates, or forwards anything a kiosk client send
 plausible future addition and is deliberately NOT built here -- it would need its own accounting
 against `KIOSK-1` before it could exist at all.
 
+### DISPLAY-3 — only the accepted locker may publish the kiosk socket
+**GIVEN** a second nixlock process starts while the compositor is already locked by a live nixlock
+process, **THEN** the compositor rejects the duplicate before it unlinks, replaces, or otherwise
+touches the active locker's kiosk socket. The original socket remains reachable and its dashboard
+client keeps streaming.
+
+Why: swayidle can invoke the lock command again while a persistent locker already owns the session
+lock. Unix socket cleanup is destructive: unlinking the pathname does not stop the original
+listener, but makes it unreachable; when the rejected duplicate exits, clients see a dead socket
+pathname and `ECONNREFUSED` even though the original process is healthy.
+
+Not: merely requesting an `ext-session-lock` is not ownership. nixlock resolves the configured
+socket path during startup but does not unlink or bind it until the compositor emits the confirmed
+`locked` event. A rejected process exits through `finished` without publishing a socket.
+
 ## Authentication — the credential and the conversation
 ### AUTH-1 — the password lives only in a zeroizing buffer
 **GIVEN** a user typing a password, **THEN** the bytes land in a buffer that is zeroized on drop, are

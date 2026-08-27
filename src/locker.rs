@@ -220,15 +220,16 @@ fn run_inner(
         diagnostics.clone(),
     );
 
-    // The kiosk display socket. Best-effort and DISPLAY-ONLY (DISPLAY-2): a bind failure here
-    // never fails the lock, it just means the kiosk output shows the built-in clock forever —
-    // see `socket::spawn`/`socket::resolve_path`.
+    // Resolve the kiosk display socket now, but do not touch its filesystem path until the
+    // compositor confirms this process owns the session lock. A second `nixlock -f` can be
+    // rejected because another locker is already active; starting the socket before that verdict
+    // would unlink the active locker's listener and strand its dashboard client (DISPLAY-3).
     let socket_state = SocketState::new();
-    match socket::resolve_path(config.socket_path.as_deref()) {
-        Some(path) => socket::spawn(path, Arc::clone(&socket_state)),
-        None => eprintln!(
+    let socket_path = socket::resolve_path(config.socket_path.as_deref());
+    if socket_path.is_none() {
+        eprintln!(
             "nixlock: socket: no XDG_RUNTIME_DIR and no socket_path configured; kiosk socket disabled"
-        ),
+        );
     }
 
     let mut locker = Locker {
@@ -246,6 +247,7 @@ fn run_inner(
         kiosk_fallback: ClockLockScreen::new(),
         session_content,
         socket: socket_state,
+        socket_path,
         keyboard: None,
         password: Zeroizing::new(String::new()),
         caps_lock: false,
@@ -356,6 +358,10 @@ struct Locker {
     /// The kiosk display socket's shared state (`crate::socket`) — the latest streamed frame, the
     /// kiosk output's current geometry (written here on `configure`), and the repaint ping.
     socket: Arc<SocketState>,
+    /// Resolved during startup and consumed only after `SessionLockHandler::locked` confirms this
+    /// process owns the compositor lock. Until then, the existing socket path belongs to the
+    /// already-active locker and must not be unlinked (DISPLAY-3).
+    socket_path: Option<PathBuf>,
     keyboard: Option<WlKeyboard>,
     password: Zeroizing<String>,
     caps_lock: bool,
@@ -578,6 +584,14 @@ impl SessionLockHandler for Locker {
         ordered.sort_by_key(|(_, _, role, _)| *role == OutputRole::Kiosk); // Session (false) first
         eprintln!("nixlock: locked; {} output(s)", ordered.len());
         self.diagnostics.lock_acquired(ordered.len());
+
+        // Only a compositor-confirmed lock owner may publish the kiosk socket. In particular, a
+        // duplicate swayidle invocation is rejected through `finished` without reaching here, so
+        // it cannot unlink and replace the active locker's listener (DISPLAY-3).
+        if let Some(path) = self.socket_path.take() {
+            socket::spawn(path, Arc::clone(&self.socket));
+        }
+
         for (output, name, role, scale) in ordered {
             let surface = self.compositor.create_surface(qh);
             let lock_surface = session_lock.create_lock_surface(surface, &output, qh);
@@ -798,5 +812,37 @@ mod tests {
                  authentication state (BEHAVIORS.md SESSION-1)"
             );
         }
+    }
+
+    // DISPLAY-3: a duplicate locker is rejected asynchronously, so anything done in `run_inner`
+    // happens too early to claim ownership of the kiosk socket. Keep the actual start inside the
+    // compositor's confirmed `locked` callback; `finished` must be able to exit without ever
+    // unlinking the active locker's socket path.
+    #[test]
+    fn the_kiosk_socket_starts_only_after_the_session_lock_is_acquired() {
+        let source = include_str!("locker.rs");
+        let startup = source
+            .split("fn run_inner(")
+            .nth(1)
+            .expect("run_inner not found")
+            .split("struct Entry")
+            .next()
+            .unwrap();
+        assert!(
+            !startup.contains("socket::spawn("),
+            "run_inner starts the kiosk socket before the compositor accepts the session lock"
+        );
+
+        let locked = source
+            .split("impl SessionLockHandler for Locker")
+            .nth(1)
+            .expect("SessionLockHandler implementation not found")
+            .split("fn finished(")
+            .next()
+            .unwrap();
+        assert!(
+            locked.contains("socket::spawn("),
+            "the confirmed locked callback never starts the kiosk socket"
+        );
     }
 }

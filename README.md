@@ -92,9 +92,10 @@ inside nixlock at all. `nixwatch`'s `nixwatch-frames` binary is exactly such a
 client; write your own in any language that can open a Unix socket.
 
 **Socket.** `$XDG_RUNTIME_DIR/nixlock.sock` by default (override with
-`socket_path` in `config.json`). nixlock creates and listens on it, unlinking any
-stale socket left by a previous run first. One client at a time -- a new
-connection replaces whatever was streaming before it.
+`socket_path` in `config.json`). After the compositor confirms that this process owns the session
+lock, nixlock creates and listens on the socket, unlinking any stale path left by a previous run
+first. A duplicate locker rejected by the compositor never touches the active locker's socket.
+One client at a time -- a new connection replaces whatever was streaming before it.
 
 **On connect**, nixlock immediately writes a **HELLO** (all integers
 little-endian):

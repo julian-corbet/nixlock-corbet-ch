@@ -54,7 +54,7 @@
       # service appears when enabled and is absent when not -- the fail-closed
       # guarantee BEHAVIORS.md AUTH-3 names). The Rust crate's own behaviour is
       # exercised by `cargo test` in-derivation (`nix build .#nixlock`); these
-      # are the Nix half: 17 tests over the kiosk display socket's wire protocol and frame
+      # are the Nix half: 18 tests over the kiosk display socket's wire protocol and frame
       # acceptance (DISPLAY-1/DISPLAY-2) and over the output-role default (an output nobody
       # configured is a lock screen, never a kiosk). CI runs both halves -- see
       # .github/workflows/ci.yml.
