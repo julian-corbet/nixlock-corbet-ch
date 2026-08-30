@@ -329,6 +329,7 @@ fn run_inner(
 }
 
 struct Entry {
+    output: wl_output::WlOutput,
     surface: SessionLockSurface,
     role: OutputRole,
     name: String,
@@ -383,6 +384,85 @@ struct Locker {
 }
 
 impl Locker {
+    fn output_details(&self, output: &wl_output::WlOutput) -> (String, OutputRole, u32) {
+        let info = self.output_state.info(output);
+        let name = info.as_ref().and_then(|i| i.name.clone()).unwrap_or_default();
+        let role = crate::content::role_for(&self.kiosk_outputs, &name);
+        let scale = info.as_ref().map(|i| i.scale_factor.max(1) as u32).unwrap_or(1);
+        (name, role, scale)
+    }
+
+    fn refresh_kiosk_geometry(&self) {
+        let geometry = self
+            .surfaces
+            .iter()
+            .find(|entry| entry.role == OutputRole::Kiosk && entry.width > 0 && entry.height > 0)
+            .map(|entry| (entry.width, entry.height, entry.scale))
+            .unwrap_or((0, 0, 1));
+        self.socket.set_geometry(geometry.0, geometry.1, geometry.2);
+    }
+
+    fn add_output_surface(
+        &mut self,
+        qh: &QueueHandle<Self>,
+        session_lock: &SessionLock,
+        output: wl_output::WlOutput,
+        reason: &'static str,
+    ) {
+        if self.surfaces.iter().any(|entry| entry.output == output) {
+            return;
+        }
+
+        let (name, role, scale) = self.output_details(&output);
+        let surface = self.compositor.create_surface(qh);
+        let lock_surface = session_lock.create_lock_surface(surface, &output, qh);
+        eprintln!("nixlock:   '{name}' -> {role:?} ({reason})");
+        self.diagnostics.output_surface_added(&name, role, reason);
+        self.surfaces.push(Entry {
+            output,
+            surface: lock_surface,
+            role,
+            name,
+            width: 0,
+            height: 0,
+            scale,
+        });
+    }
+
+    fn update_output_surface(&mut self, qh: &QueueHandle<Self>, output: wl_output::WlOutput) {
+        let Some(idx) = self.surfaces.iter().position(|entry| entry.output == output) else {
+            let Some(session_lock) = self.lock.clone().filter(SessionLock::is_locked) else {
+                return;
+            };
+            self.add_output_surface(qh, &session_lock, output, "update-after-lock");
+            return;
+        };
+
+        let (name, role, scale) = self.output_details(&output);
+        let entry = &mut self.surfaces[idx];
+        if entry.name == name && entry.role == role && entry.scale == scale {
+            return;
+        }
+
+        entry.name = name;
+        entry.role = role;
+        entry.scale = scale;
+        self.diagnostics
+            .output_surface_updated(&entry.name, entry.role, entry.scale);
+        self.refresh_kiosk_geometry();
+        self.render_surface(idx);
+    }
+
+    fn remove_output_surface(&mut self, output: &wl_output::WlOutput) {
+        let Some(idx) = self.surfaces.iter().position(|entry| &entry.output == output) else {
+            return;
+        };
+        let entry = self.surfaces.remove(idx);
+        eprintln!("nixlock: output removed: '{}' ({:?})", entry.name, entry.role);
+        self.diagnostics.output_surface_removed(&entry.name, entry.role);
+        self.refresh_kiosk_geometry();
+    }
+
     fn auth_view(&self) -> AuthView {
         let state = if self.verifying {
             AuthState::Verifying
@@ -570,18 +650,8 @@ impl SessionLockHandler for Locker {
     fn locked(&mut self, _conn: &Connection, qh: &QueueHandle<Self>, session_lock: SessionLock) {
         // Create Session (lock-screen) outputs FIRST so keyboard focus lands on a lock screen,
         // never on a kiosk output (KIOSK-1: kiosk surfaces are input-inert).
-        let mut ordered: Vec<(wl_output::WlOutput, String, OutputRole, u32)> = self
-            .output_state
-            .outputs()
-            .map(|o| {
-                let info = self.output_state.info(&o);
-                let name = info.as_ref().and_then(|i| i.name.clone()).unwrap_or_default();
-                let scale = info.as_ref().map(|i| i.scale_factor.max(1) as u32).unwrap_or(1);
-                let role = crate::content::role_for(&self.kiosk_outputs, &name);
-                (o, name, role, scale)
-            })
-            .collect();
-        ordered.sort_by_key(|(_, _, role, _)| *role == OutputRole::Kiosk); // Session (false) first
+        let mut ordered: Vec<wl_output::WlOutput> = self.output_state.outputs().collect();
+        ordered.sort_by_key(|output| self.output_details(output).1 == OutputRole::Kiosk);
         eprintln!("nixlock: locked; {} output(s)", ordered.len());
         self.diagnostics.lock_acquired(ordered.len());
 
@@ -592,18 +662,8 @@ impl SessionLockHandler for Locker {
             socket::spawn(path, Arc::clone(&self.socket));
         }
 
-        for (output, name, role, scale) in ordered {
-            let surface = self.compositor.create_surface(qh);
-            let lock_surface = session_lock.create_lock_surface(surface, &output, qh);
-            eprintln!("nixlock:   '{name}' -> {role:?}");
-            self.surfaces.push(Entry {
-                surface: lock_surface,
-                role,
-                name,
-                width: 0,
-                height: 0,
-                scale,
-            });
+        for output in ordered {
+            self.add_output_surface(qh, &session_lock, output, "initial-lock");
         }
         if let Some(ready) = self.daemon_ready.take() {
             let notified = ready.notify().is_ok();
@@ -645,10 +705,8 @@ impl SessionLockHandler for Locker {
             );
             // The one (v1) kiosk output's geometry is what a connecting socket client's HELLO
             // reports, and what an already-connected client's frames are validated against — keep
-            // it current on every configure, including a later resize.
-            if self.surfaces[idx].role == OutputRole::Kiosk {
-                self.socket.set_geometry(w, h, self.surfaces[idx].scale);
-            }
+            // it current on every configure, including a later resize or hot-unplug.
+            self.refresh_kiosk_geometry();
             self.render_surface(idx);
         }
     }
@@ -746,9 +804,23 @@ impl OutputHandler for Locker {
     fn output_state(&mut self) -> &mut OutputState {
         &mut self.output_state
     }
-    fn new_output(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {}
-    fn update_output(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {}
-    fn output_destroyed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {}
+    fn new_output(&mut self, _: &Connection, qh: &QueueHandle<Self>, output: wl_output::WlOutput) {
+        let Some(session_lock) = self.lock.clone().filter(SessionLock::is_locked) else {
+            // Initial output discovery finishes before lock acquisition. `locked` snapshots those
+            // outputs after the compositor confirms ownership; only later advertisements belong
+            // to the hotplug path here (LOCK-3).
+            return;
+        };
+        self.add_output_surface(qh, &session_lock, output, "hotplug");
+    }
+
+    fn update_output(&mut self, _: &Connection, qh: &QueueHandle<Self>, output: wl_output::WlOutput) {
+        self.update_output_surface(qh, output);
+    }
+
+    fn output_destroyed(&mut self, _: &Connection, _: &QueueHandle<Self>, output: wl_output::WlOutput) {
+        self.remove_output_surface(&output);
+    }
 }
 impl ShmHandler for Locker {
     fn shm_state(&mut self) -> &mut Shm {
@@ -844,5 +916,31 @@ mod tests {
             locked.contains("socket::spawn("),
             "the confirmed locked callback never starts the kiosk socket"
         );
+    }
+
+    // LOCK-3: this source-level guard complements checks/headless-output-hotplug.sh's real
+    // compositor exercise. It keeps all three OutputHandler callbacks wired to the lifecycle
+    // helpers so a later cleanup cannot silently restore the zero-output lockout.
+    #[test]
+    fn output_callbacks_maintain_lock_surfaces_after_acquisition() {
+        let source = include_str!("locker.rs");
+        let handler = source
+            .split("impl OutputHandler for Locker")
+            .nth(1)
+            .expect("OutputHandler implementation not found")
+            .split("impl ShmHandler for Locker")
+            .next()
+            .unwrap();
+
+        for required in [
+            "self.add_output_surface(",
+            "self.update_output_surface(",
+            "self.remove_output_surface(",
+        ] {
+            assert!(
+                handler.contains(required),
+                "OutputHandler lost `{required}`, so a locked-session hotplug can become invisible"
+            );
+        }
     }
 }

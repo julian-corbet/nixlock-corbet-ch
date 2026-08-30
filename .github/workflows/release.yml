@@ -70,6 +70,7 @@ jobs:
 
           printf '%s\n' \
             "Prebuilt x86-64-v3 binary linked against Arch system libpam." \
+            "Creates lock surfaces for outputs that appear after a zero-output lock, fixing invisible post-resume locks." \
             "Publishes the kiosk socket only after confirmed session-lock ownership, so a rejected duplicate locker cannot replace the live dashboard socket." \
             > release-notes.md
 

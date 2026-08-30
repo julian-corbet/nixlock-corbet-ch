@@ -1,6 +1,6 @@
 [package]
 name = "nixlock"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2021"
 license = "MIT"
 description = "A Wayland session locker that keeps kiosk outputs live while locking the rest, with PAM unlock"

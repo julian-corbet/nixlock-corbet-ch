@@ -12,7 +12,7 @@
 # not input, so its rendered config.json is asserted by the consuming infra's
 # own home evaluation rather than here. Keeping this to a pure nixpkgs NixOS
 # eval is exactly what lets `nix flake check` run it with no extra inputs.
-{ pkgs, nixpkgs }:
+{ pkgs, nixpkgs, nixlock }:
 let
   lib = pkgs.lib;
   system = pkgs.stdenv.hostPlatform.system;
@@ -42,4 +42,17 @@ in
     (if failures == [ ]
     then "echo 'nixlock module eval checks passed (${toString (lib.length assertions)})' > $out"
     else throw "nixlock eval checks failed: ${toString (map (a: a.name) failures)}");
+
+  # LOCK-3 against a real, private compositor. The fixture starts Sway with zero outputs, waits
+  # until nixlock owns the session lock, then adds a headless output through a PID-bound IPC socket
+  # inside its private XDG_RUNTIME_DIR. The seated compositor is never in scope.
+  headless-output-hotplug = pkgs.runCommand "nixlock-headless-output-hotplug" {
+    nativeBuildInputs = [ pkgs.bash pkgs.coreutils pkgs.gnugrep pkgs.sway nixlock ];
+  } ''
+    bash ${./headless-output-hotplug.sh} \
+      ${nixlock}/bin/nixlock \
+      ${pkgs.sway}/bin/sway \
+      ${pkgs.sway}/bin/swaymsg
+    touch "$out"
+  '';
 }

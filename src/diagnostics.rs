@@ -67,6 +67,24 @@ impl Diagnostics {
         ));
     }
 
+    pub(crate) fn output_surface_added(&self, output: &str, role: OutputRole, reason: &'static str) {
+        self.emit(format_args!(
+            "event=output_surface_added output={output:?} role={role:?} reason={reason}"
+        ));
+    }
+
+    pub(crate) fn output_surface_updated(&self, output: &str, role: OutputRole, scale: u32) {
+        self.emit(format_args!(
+            "event=output_surface_updated output={output:?} role={role:?} scale={scale}"
+        ));
+    }
+
+    pub(crate) fn output_surface_removed(&self, output: &str, role: OutputRole) {
+        self.emit(format_args!(
+            "event=output_surface_removed output={output:?} role={role:?}"
+        ));
+    }
+
     pub(crate) fn keyboard_capability(&self, present: bool) {
         self.emit(format_args!(
             "event=keyboard_capability state={}",

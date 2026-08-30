@@ -39,6 +39,20 @@ its own death unlock the screen.
 Not: nixlock sends the compositor's unlock request on exactly one path -- a verified password
 (`SESSION-1`) -- and on no other: not a signal, not a timeout, not exit, not a panic handler.
 
+### LOCK-3 — every output advertised while locked receives a lock surface
+**GIVEN** the compositor confirms the session lock while no outputs exist, or an output is added,
+removed, renamed, or rescaled after lock acquisition, **THEN** nixlock creates, updates, or destroys
+the corresponding lock surface immediately. A later Session output shows the password screen and a
+later Kiosk output stays input-inert; neither can become an invisible locked output.
+
+Why: lid-close can remove the internal panel before `before-sleep` acquires the lock, and dock
+outputs may not return until resume. Snapshotting outputs only once at lock acquisition leaves the
+compositor correctly locked but with no client surface to paint or focus, so the user sees neither a
+password field nor the unlocked desktop and has no normal way to authenticate.
+
+Not: a zero-output lock is not an error and must not unlock or delay suspend. nixlock holds the
+compositor lock, watches the output lifecycle, and paints each output whenever it appears.
+
 ## Kiosk — a live display that is never an escape
 ### KIOSK-1 — kiosk surfaces are input-inert; keys never reach the session
 **GIVEN** a kiosk output rendering a live dashboard, **THEN** keyboard and pointer input over that

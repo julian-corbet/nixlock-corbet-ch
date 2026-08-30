@@ -64,7 +64,8 @@ session's idle/lock command at the bare name `nixlock` -- so swayidle locks with
 
 ## Output roles
 
-Every output the compositor lists at lock time is one of two roles:
+Every output the compositor advertises while the session is locked -- including one added after
+lid-close, suspend, resume, or a dock hotplug -- is one of two roles:
 
 - **Session** -- an ordinary lock screen. It prompts for a password; a correct
   PAM password unlocks the whole session (there is one lock, shared across all
@@ -78,6 +79,10 @@ Every output the compositor lists at lock time is one of two roles:
 Which outputs are kiosk is a per-host value (`kioskOutputs`, a list of connector
 names such as `DP-3`). Anything not named is a Session output. Name nothing and
 every output is a Session lock -- the plain swaylock-equivalent baseline.
+
+Locking with no outputs is valid. nixlock retains the compositor lock and creates the appropriate
+lock surface as each output appears; removing and reconnecting an output replaces its surface
+without exposing the session (`BEHAVIORS.md` LOCK-3).
 
 If a kiosk output's socket client sends nothing usable (not connected yet, a
 mismatched frame, a disconnect), that output falls back to nixlock's own built-in

@@ -62,6 +62,7 @@
         import ./checks {
           pkgs = pkgsFor system;
           nixpkgs = nixpkgs.outPath;
+          nixlock = self.packages.${system}.nixlock;
         });
 
       formatter = forAllSystems (system: (pkgsFor system).nixpkgs-fmt);

@@ -5,7 +5,7 @@
 
 rustPlatform.buildRustPackage {
   pname = "nixlock";
-  version = "0.1.4";
+  version = "0.1.5";
   src = ./.;
 
   # Cargo.lock is committed so this builds fully offline and reproducibly --
